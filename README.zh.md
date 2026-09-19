@@ -1,6 +1,6 @@
 # dsh-view-state
 
-[![test](https://img.shields.io/badge/test-94%20assertions%20passing-brightgreen)](#测试) · [English](README.md)
+[![test](https://img.shields.io/badge/test-101%20assertions%20passing-brightgreen)](#测试) · [English](README.md)
 
 **让 DeepSeek Harness（`dsh`）Web UI 的「每标签页视图状态」可被外部寻址。**
 
@@ -167,7 +167,7 @@ webView.Source = new Uri(restored);
 node test/client-half.test.mjs     # 或：npm test
 ```
 
-94 条断言，零依赖，无需浏览器：用一份手写的假 `ctx`（服务 `sessions`、
+101 条断言，零依赖，无需浏览器：用一份手写的假 `ctx`（服务 `sessions`、
 `layout`、`slots`，以及 `effect`）加载真实的 `lib/client.js`，并配合
 `window`、`history`、`localStorage` 的替身。覆盖内容：冻结契约、精确的 URL
 字符串结果、pathname 保留、`token` 保留与外来参数的字节级不变、未知 id 丢弃、

@@ -1,6 +1,6 @@
 # dsh-view-state
 
-[![test](https://img.shields.io/badge/test-94%20assertions%20passing-brightgreen)](#testing) · [中文](README.zh.md)
+[![test](https://img.shields.io/badge/test-101%20assertions%20passing-brightgreen)](#testing) · [中文](README.zh.md)
 
 **Addressable per-tab view state for the DeepSeek Harness (`dsh`) web UI.**
 
@@ -186,7 +186,7 @@ underlying API facts are in [`docs/API-NOTES.md`](docs/API-NOTES.md).
 node test/client-half.test.mjs     # or: npm test
 ```
 
-94 assertions, no dependencies, no browser: the real `lib/client.js` is loaded
+101 assertions, no dependencies, no browser: the real `lib/client.js` is loaded
 through a hand-written fake `ctx` (services `sessions`, `layout`, `slots`, plus
 `effect`), with `window`, `history` and `localStorage` shims. It covers the frozen
 contract, the exact resulting URL strings, pathname preservation, `token`

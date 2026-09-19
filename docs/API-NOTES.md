@@ -351,7 +351,7 @@ second copy is never installed.
 - Every API claim above was read from the shipped `.js`/`.d.ts` on this machine.
 - `lib/client.js` syntax-checks under Node 24 (`node --check`).
 - `lib/index.js` is loadable ESM exporting a function `apply`.
-- 94 stub-Cordis assertions pass (`node test/client-half.test.mjs`), covering the
+- 101 stub-Cordis assertions pass (`node test/client-half.test.mjs`), covering the
   frozen contract, both fail-soft paths, the localStorage precedence rules, the
   parameter-hygiene rules, the un-pinned-store probe, and effect teardown.
 

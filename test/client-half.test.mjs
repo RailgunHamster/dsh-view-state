@@ -842,6 +842,53 @@ check(
 	check("unload: layout store subscription released", store.listeners.size === 0, `layout listeners = ${store.listeners.size}`);
 }
 
+// 7b. an unresolved session id schedules retries; unload clears the pending one
+{
+	resetPage({ search: "?dsh_session=session-maybe" });
+	opened = [];
+	// The list never loads, so the id stays unresolved and the escalating retry
+	// schedule is what keeps the watch alive.
+	const sessions = makeSessions({ ids: [], byId: {}, current: void 0 });
+	const store = makeSlotStore({ sidebar: 280, viewportWidth: 1400, rightbar: null });
+	const ctx = fakeCtx({ sessions: sessions.service, layoutStore: makeSlotStoreHandle(store.instance) });
+
+	const realSetTimeout = globalThis.setTimeout;
+	const realClearTimeout = globalThis.clearTimeout;
+	const scheduled = [];
+	const cleared = [];
+	globalThis.setTimeout = (_fn, delay) => {
+		const handle = { id: scheduled.length };
+		scheduled.push(delay);
+		return handle;
+	};
+	globalThis.clearTimeout = (handle) => {
+		cleared.push(handle);
+	};
+
+	let threw = null;
+	try {
+		boot(ctx);
+		// The first attempt runs synchronously and defers to a microtask; letting
+		// that microtask run is what turns the watch into a real pending timer.
+		await Promise.resolve();
+		await Promise.resolve();
+	} catch (error) {
+		threw = error;
+	}
+	const pendingBeforeUnload = scheduled.length;
+	for (const disposer of ctx.effects) if (typeof disposer === "function") disposer();
+	globalThis.setTimeout = realSetTimeout;
+	globalThis.clearTimeout = realClearTimeout;
+
+	check("retry: apply() did not throw", threw === null, String(threw));
+	check("retry: an unresolved id scheduled a real retry timer", pendingBeforeUnload >= 1, `scheduled = ${JSON.stringify(scheduled)}`);
+	check("retry: the retry delays escalate from the documented schedule", scheduled.every((delay, i) => i === 0 || delay >= scheduled[i - 1]), `scheduled = ${JSON.stringify(scheduled)}`);
+	check("retry: unload cleared the pending retry", cleared.length >= 1, `cleared = ${cleared.length}, scheduled = ${scheduled.length}`);
+	check("retry: nothing threw while the list stayed empty", threw === null);
+	check("retry: no session was opened for an unresolvable id", opened.length === 0, `opened = ${JSON.stringify(opened)}`);
+	check("retry: no warning for an id that is merely unresolved", page.warnings.length === 0, `warnings = ${JSON.stringify(page.warnings)}`);
+}
+
 // ---------------------------------------------------------------------------
 // Restore console and report
 // ---------------------------------------------------------------------------
