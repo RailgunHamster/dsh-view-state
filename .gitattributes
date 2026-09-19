@@ -1,0 +1,7 @@
+# Normalize line endings in the repository so the plain-JS sources read the same
+# everywhere (the plugin ships without a build step, so the committed bytes are
+# the shipped bytes).
+* text=auto eol=lf
+*.png binary
+*.jpg binary
+*.ico binary

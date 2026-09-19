@@ -1,0 +1,16 @@
+# dsh-view-state bundle patch — applied automatically when this package is
+# installed with `dsh plugin --profile <name> add dsh-view-state`
+# (the package declares `dsh.bundle.patch` in its package.json).
+#
+# Inserts this package's own row only. Nothing upstream is needed: the three
+# services this plugin reads (`sessions`, `layout`, `slots`) are already
+# composed by the shipped web bundle, and the plugin declares no hard service
+# dependency anyway (an empty `inject`), so it can never wedge the boot on a
+# missing service.
+#
+# Deliberately not inserting any row for the packages that PROVIDE those
+# services: a second entry with the same id fails the whole boot with
+# "duplicate loader entry id: ...".
+- insert:
+    - id: view-state
+      name: 'dsh-view-state'

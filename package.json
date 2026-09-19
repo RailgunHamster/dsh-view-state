@@ -1,0 +1,72 @@
+{
+  "name": "dsh-view-state",
+  "version": "0.1.0",
+  "description": "Addressable per-tab view state for the DeepSeek Harness (dsh) web UI: mirrors the selected session and both panel widths into dsh_session/dsh_sidebar/dsh_rightbar query parameters, and restores them on load, so an external shell can read and replay what the user was looking at.",
+  "type": "module",
+  "main": "lib/index.js",
+  "exports": {
+    ".": "./lib/index.js",
+    "./client": "./lib/client.js",
+    "./cordis.patch.yml": "./cordis.patch.yml",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "lib",
+    "cordis.patch.yml",
+    "docs",
+    "LICENSE",
+    "README.md",
+    "README.zh.md"
+  ],
+  "scripts": {
+    "test": "node test/client-half.test.mjs",
+    "prepublishOnly": "npm test"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web",
+      "inject": [
+        "@deepseek-ai/dsh-client-ui-renderer",
+        "@deepseek-ai/dsh-client-ui-layout",
+        "@deepseek-ai/dsh-api-session-controller"
+      ]
+    }
+  },
+  "keywords": [
+    "deepseek",
+    "deepseek-harness",
+    "dsh",
+    "view-state",
+    "layout",
+    "session",
+    "plugin"
+  ],
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/RailgunHamster/dsh-view-state.git"
+  },
+  "peerDependencies": {
+    "@deepseek-ai/cordis": "^4.0.2",
+    "@deepseek-ai/dsh-api-session-controller": "^0.1.0-rc.6 || ^0.1.5-rc.1",
+    "@deepseek-ai/dsh-client-ui-layout": "^0.1.0-rc.6 || ^0.1.5-rc.1",
+    "@deepseek-ai/dsh-client-ui-renderer": "^0.1.0-rc.6 || ^0.1.5-rc.1"
+  },
+  "peerDependenciesMeta": {
+    "@deepseek-ai/dsh-api-session-controller": {
+      "optional": true
+    },
+    "@deepseek-ai/dsh-client-ui-layout": {
+      "optional": true
+    },
+    "@deepseek-ai/dsh-client-ui-renderer": {
+      "optional": true
+    }
+  },
+  "engines": {
+    "node": ">=22"
+  }
+}
