@@ -213,29 +213,64 @@ function makeSlotStoreHandle(instance) {
 	};
 }
 
-/** A sessions service whose list snapshot is mutable from the test. */
-function makeSessions(initial) {
+/**
+ * The session controller's own persisted selection cell, as the shipped
+ * controller creates it:
+ *
+ *   this.selection = createSnapshotStore({}, { persist: { name: "dsh.sessions.current" } });
+ *
+ * Only its read face is reproduced (`getSnapshot` / `subscribe`), because that is
+ * all the plugin is allowed to touch. `set()` stands in for the controller
+ * writing the cell through, and notifies like the real store does.
+ */
+function makeSelectionStore(initial) {
 	let snapshot = initial;
 	const listeners = new Set();
 	return {
-		service: {
-			list: {
-				getSnapshot: () => snapshot,
-				subscribe(fn) {
-					listeners.add(fn);
-					return () => listeners.delete(fn);
-				},
-			},
-			open(id) {
-				if (!Object.prototype.hasOwnProperty.call(snapshot.byId ?? {}, id)) {
-					// The real `open()` fails loud for ids outside the list.
-					throw new Error(`unknown session ${id}`);
-				}
-				opened.push(id);
-				snapshot = { ...snapshot, current: id };
-				for (const listener of [...listeners]) listener();
+		store: {
+			getSnapshot: () => snapshot,
+			subscribe(fn) {
+				listeners.add(fn);
+				return () => listeners.delete(fn);
 			},
 		},
+		set(next) {
+			snapshot = next;
+			for (const listener of [...listeners]) listener();
+		},
+		listenerCount: () => listeners.size,
+	};
+}
+
+/** A sessions service whose list snapshot is mutable from the test. */
+function makeSessions(initial, { selection } = {}) {
+	let snapshot = initial;
+	const listeners = new Set();
+	const service = {
+		list: {
+			getSnapshot: () => snapshot,
+			subscribe(fn) {
+				listeners.add(fn);
+				return () => listeners.delete(fn);
+			},
+		},
+		open(id) {
+			if (!Object.prototype.hasOwnProperty.call(snapshot.byId ?? {}, id)) {
+				// The real `open()` fails loud for ids outside the list.
+				throw new Error(`unknown session ${id}`);
+			}
+			opened.push(id);
+			snapshot = { ...snapshot, current: id };
+			for (const listener of [...listeners]) listener();
+		},
+	};
+	// The persisted selection cell lives as an own property on the very object
+	// provided as `ctx.sessions` (the shipped controller does the same). Opt-in on
+	// purpose: every pre-0.2.1 case keeps a sessions service with no `selection`,
+	// which is exactly the shape the plugin still has to tolerate.
+	if (selection !== void 0) service.selection = selection.store;
+	return {
+		service,
 		set(next) {
 			snapshot = next;
 			for (const listener of [...listeners]) listener();
@@ -1073,8 +1108,15 @@ check(
 	slots.set("root", [{ options: {}, component: () => null, store: makeSlotStoreHandle(store.instance) }]);
 	check("retry store: the width was applied once the seat appeared", store.instance.getSnapshot().layoutInfo.sidebar === 320, `sidebar = ${store.instance.getSnapshot().layoutInfo.sidebar}`);
 	check("retry store: the newly known facts were mirrored", page.search === "?dsh_sidebar=320&token=xyz&dsh_rightbar=0", `search = ${page.search}`);
-	check("retry store: reaching the store cancelled the fallback polling", clock.pending() === 0, `pending = ${clock.pending()}`);
+	// The layout watch stopped, but a boot with no sessions service keeps ONE timer
+	// armed on purpose: the sessions service arrives after apply() and there is no
+	// registry to subscribe to for it (see watchSessions). Draining the clock must
+	// therefore leave nothing armed.
 	check("retry store: no warning at all in the happy path", page.warnings.length === 0, `warnings = ${JSON.stringify(page.warnings)}`);
+	clock.flush();
+	check("retry store: giving up on the sessions service leaves no timer armed", clock.pending() === 0, `pending = ${clock.pending()}`);
+	check("retry store: draining the clock changed nothing", page.search === "?dsh_sidebar=320&token=xyz&dsh_rightbar=0", `search = ${page.search}`);
+	check("retry store: and emitted no warning", page.warnings.length === 0, `warnings = ${JSON.stringify(page.warnings)}`);
 
 	// And the store is live thereafter: a real resize is mirrored.
 	store.actions.setSidebar(360);
@@ -1186,6 +1228,317 @@ check(
 	check("late boot: the layout degrade is reported once the layout retries are spent", page.warnings.length === 1 && page.warnings[0].includes("panel widths cannot be restored"), `warnings = ${JSON.stringify(page.warnings)}`);
 	check("late boot: both parameters survive the give-up", page.search === "?dsh_session=session-late&dsh_sidebar=320", `search = ${page.search}`);
 	clock.restore();
+}
+
+// ---------------------------------------------------------------------------
+// 9. session read order: `list.current` first, then the controller's persisted
+//    selection cell (the 0.2.1 defect)
+// ---------------------------------------------------------------------------
+//
+// Measured in a real browser profile before this fix: for one origin the app's
+// own leveldb held `dsh.sessions.current = {"sessionId":"session-…"}`, while
+// `sessions.list.getSnapshot().current` was `undefined` — the list store's field
+// doc calls that a transiently absent selection — and this plugin recorded
+// `{"session":null,…}`. Every captured preset therefore carried an empty
+// `dsh_session`. The controller's persisted cell is the durable half of the same
+// fact and is reachable as `sessions.selection.getSnapshot().sessionId`; these
+// cases pin the order, the structural guard, and both subscription paths.
+
+// 9a. `list.current` undefined while the persisted selection cell is set
+{
+	resetPage({ search: "?token=xyz" });
+	opened = [];
+	const store = makeSlotStore({ sidebar: 280, viewportWidth: 1400, rightbar: null });
+	// The list is pending and reports no current — exactly the measured state.
+	const sessions = makeSessions(
+		{ ids: [], byId: {}, current: void 0 },
+		{ selection: makeSelectionStore({ sessionId: "session-restored" }) },
+	);
+	boot(fakeCtx({ sessions: sessions.service, layoutStore: makeSlotStoreHandle(store.instance) }));
+	check(
+		"selection fallback: the persisted selection reaches the URL",
+		page.search.includes("dsh_session=session-restored"),
+		`search = ${page.search}`,
+	);
+	check(
+		"selection fallback: localStorage records it instead of null",
+		storage.get("dsh.view-state.v1") !== void 0 && JSON.parse(storage.get("dsh.view-state.v1")).session === "session-restored",
+		`stored = ${String(storage.get("dsh.view-state.v1"))}`,
+	);
+	check("selection fallback: foreign token preserved", page.search.includes("token=xyz"), `search = ${page.search}`);
+	check("selection fallback: never opened a session just to read it", opened.length === 0, `opened = ${JSON.stringify(opened)}`);
+	// The widths are known as soon as the pinned seat is reachable, so the exact
+	// URL is the token, the session the app persisted, and the two store facts.
+	check(
+		"selection fallback: exact URL",
+		page.search === "?token=xyz&dsh_session=session-restored&dsh_sidebar=280&dsh_rightbar=0",
+		`search = ${page.search}`,
+	);
+}
+
+// 9b. the same divergence, with a root seat that only appears later
+{
+	resetPage({ search: "?token=xyz&dsh_sidebar=320" });
+	opened = [];
+	const clock = installFakeClock();
+	const slots = makeSlots();
+	const store = makeSlotStore({ sidebar: 280, viewportWidth: 1400, rightbar: null });
+	const sessions = makeSessions(
+		{ ids: [], byId: {}, current: void 0 },
+		{ selection: makeSelectionStore({ sessionId: "session-restored" }) },
+	);
+	boot(fakeCtx({ sessions: sessions.service, slotsService: slots.service }));
+	// The session fact is known from the persisted cell before any layout seat
+	// exists, so the parameter is published while the widths stay unknown.
+	check(
+		"selection fallback/late seat: the session parameter is published before the seat arrives",
+		page.search === "?token=xyz&dsh_sidebar=320&dsh_session=session-restored",
+		`search = ${page.search}`,
+	);
+	slots.set("root", [{ options: {}, component: () => null, store: makeSlotStoreHandle(store.instance) }]);
+	check("selection fallback/late seat: the width was applied", store.instance.getSnapshot().layoutInfo.sidebar === 320, `sidebar = ${store.instance.getSnapshot().layoutInfo.sidebar}`);
+	check(
+		"selection fallback/late seat: session and widths are all mirrored",
+		page.search === "?token=xyz&dsh_sidebar=320&dsh_session=session-restored&dsh_rightbar=0",
+		`search = ${page.search}`,
+	);
+	check("selection fallback/late seat: no warning", page.warnings.length === 0, `warnings = ${JSON.stringify(page.warnings)}`);
+	clock.restore();
+}
+
+// 9c. the public list still wins when both sources carry a value
+{
+	resetPage({ search: "?dsh_session=session-restored&token=xyz" });
+	opened = [];
+	const store = makeSlotStore({ sidebar: 280, viewportWidth: 1400, rightbar: null });
+	// The two sources disagree on purpose: `list.current` is the public read face,
+	// so it must win over the persisted cell rather than the other way round.
+	const sessions = makeSessions(
+		{ ids: ["session-live"], byId: { "session-live": { id: "session-live" } }, current: "session-live" },
+		{ selection: makeSelectionStore({ sessionId: "session-restored" }) },
+	);
+	boot(fakeCtx({ sessions: sessions.service, layoutStore: makeSlotStoreHandle(store.instance) }));
+	check(
+		"read order: list.current wins over the persisted selection",
+		page.search.includes("dsh_session=session-live") && !page.search.includes("session-restored"),
+		`search = ${page.search}`,
+	);
+}
+
+// 9d. a wrong-shaped `selection` changes nothing: the fallback never exists
+{
+	resetPage({ search: "?dsh_session=session-restored" });
+	opened = [];
+	const store = makeSlotStore({ sidebar: 280, viewportWidth: 1400, rightbar: null });
+	const sessions = makeSessions({
+		ids: ["session-live"],
+		byId: { "session-live": { id: "session-live" } },
+		current: "session-live",
+	});
+	// `getSnapshot` is missing, so the cell is not a store: the plugin must not
+	// reach into it, and the list's own reading still governs.
+	sessions.service.selection = { sessionId: "session-restored" };
+	boot(fakeCtx({ sessions: sessions.service, layoutStore: makeSlotStoreHandle(store.instance) }));
+	check(
+		"wrong shape: the unusable selection cell is ignored and list.current governs",
+		page.search.includes("dsh_session=session-live"),
+		`search = ${page.search}`,
+	);
+}
+
+// 9e. a stored cell whose sessionId is not a usable string is absent, not a crash
+{
+	resetPage({ search: "?dsh_session=session-stale" });
+	opened = [];
+	const store = makeSlotStore({ sidebar: 280, viewportWidth: 1400, rightbar: null });
+	const sessions = makeSessions(
+		{ ids: [], byId: {}, current: void 0 },
+		{ selection: makeSelectionStore({ sessionId: 42 }) },
+	);
+	let threw = null;
+	try {
+		boot(fakeCtx({ sessions: sessions.service, layoutStore: makeSlotStoreHandle(store.instance) }));
+	} catch (error) {
+		threw = error;
+	}
+	check("wrong shape: apply() did not throw", threw === null, String(threw));
+	// Neither source is usable, so the session fact is unknown and the caller's
+	// parameter is left exactly as supplied (rule 4) rather than erased.
+	check(
+		"wrong shape: the caller's dsh_session survives",
+		page.search.includes("dsh_session=session-stale"),
+		`search = ${page.search}`,
+	);
+}
+
+// 9f. a selection change re-mirrors (today only `sessions.list` was subscribed)
+{
+	resetPage({ search: "?token=xyz" });
+	opened = [];
+	const store = makeSlotStore({ sidebar: 280, viewportWidth: 1400, rightbar: null });
+	const selection = makeSelectionStore({ sessionId: "session-a" });
+	const sessions = makeSessions({ ids: [], byId: {}, current: void 0 }, { selection });
+	boot(fakeCtx({ sessions: sessions.service, layoutStore: makeSlotStoreHandle(store.instance) }));
+	check("selection subscription: the cell was subscribed", selection.listenerCount() === 1, `listeners = ${selection.listenerCount()}`);
+	check("selection subscription: first value mirrored", page.search.includes("dsh_session=session-a"), `search = ${page.search}`);
+
+	// A selection change that never touches `list.current`: the persisted cell is
+	// the only source that moved, so only its subscription can see this.
+	selection.set({ sessionId: "session-b" });
+	check("selection subscription: the change re-mirrored into the URL", page.search.includes("dsh_session=session-b") && !page.search.includes("session-a"), `search = ${page.search}`);
+	check(
+		"selection subscription: the change re-mirrored into localStorage",
+		JSON.parse(storage.get("dsh.view-state.v1")).session === "session-b",
+		`stored = ${String(storage.get("dsh.view-state.v1"))}`,
+	);
+	check("selection subscription: token still preserved", page.search.includes("token=xyz"), `search = ${page.search}`);
+	check("selection subscription: still replaceState only", page.pushCalls.length === 0);
+
+	// When the list finally agrees, the public face keeps governing.
+	sessions.set({ ids: ["session-b"], byId: { "session-b": { id: "session-b" } }, current: "session-b" });
+	check("selection subscription: list.current still agrees and wins", page.search.includes("dsh_session=session-b"), `search = ${page.search}`);
+
+	// And the cell is released on unload.
+	const disposers = booted[booted.length - 1].effects;
+	for (const disposer of disposers) if (typeof disposer === "function") disposer();
+	check("selection subscription: unload released the cell subscription", selection.listenerCount() === 0, `listeners = ${selection.listenerCount()}`);
+}
+
+// 9g. neither source resolves: the parameter is preserved, never removed
+{
+	resetPage({ search: "?dsh_session=session-existing&dsh_sidebar=320&token=xyz" });
+	opened = [];
+	const clock = installFakeClock();
+	// A sessions service with no readable list and no selection cell at all: both
+	// sources are unknown, which must leave the parameter byte-identical.
+	const sessions = makeSessions({ ids: [], byId: {}, current: void 0 });
+	delete sessions.service.list;
+	boot(fakeCtx({ sessions: sessions.service }));
+	await microtasks();
+	clock.flush();
+	check(
+		"neither source: the caller's dsh_session is preserved",
+		page.search.includes("dsh_session=session-existing"),
+		`search = ${page.search}`,
+	);
+	check("neither source: the sidebar parameter is preserved too", page.search.includes("dsh_sidebar=320"), `search = ${page.search}`);
+	check("neither source: no warning names a dropped session", !page.warnings.some((line) => line.includes("unknown session id")), `warnings = ${JSON.stringify(page.warnings)}`);
+	clock.restore();
+}
+
+// 9h. a readable selection cell that holds nothing is absent, while a MISSING
+//     cell is unknown — the two are deliberately different
+{
+	resetPage({ search: "?dsh_session=session-ghost&dsh_sidebar=280" });
+	opened = [];
+	// The controller IS present (both stores readable) and the list HAS loaded
+	// without the parameter's id and with no current selection. The cell is
+	// readable and holds nothing, so the selection is known to be absent and the
+	// parameter is removed — the same outcome as before 0.2.1.
+	const sessions = makeSessions(
+		{ ids: ["session-other"], byId: { "session-other": { id: "session-other" } }, current: void 0 },
+		{ selection: makeSelectionStore({}) },
+	);
+	const store = makeSlotStore({ sidebar: 280, viewportWidth: 1400, rightbar: null });
+	boot(fakeCtx({ sessions: sessions.service, layoutStore: makeSlotStoreHandle(store.instance) }));
+	check(
+		"empty cell: a readable cell holding no selection is absent, so the parameter goes",
+		!page.search.includes("dsh_session"),
+		`search = ${page.search}`,
+	);
+	check("empty cell: the rest of the URL is intact", page.search.includes("dsh_sidebar=280"), `search = ${page.search}`);
+}
+
+{
+	// The contrast case: no readable cell at all, and an id the list never
+	// resolves. Nothing is known about the selection, so the parameter is left
+	// exactly as supplied (rule 4) rather than erased, and no warning claims the id
+	// was dropped. Before 0.2.1 the list alone was read and the retry watch meant
+	// the same thing here; what changed is only which *readings* exist.
+	resetPage({ search: "?dsh_session=session-ghost&dsh_sidebar=280" });
+	opened = [];
+	const clock = installFakeClock();
+	const sessions = makeSessions({ ids: [], byId: {}, current: void 0 });
+	const store = makeSlotStore({ sidebar: 280, viewportWidth: 1400, rightbar: null });
+	boot(fakeCtx({ sessions: sessions.service, layoutStore: makeSlotStoreHandle(store.instance) }));
+	await microtasks();
+	clock.flush();
+	check(
+		"missing cell: an unresolved id with no cell to fall back on is preserved",
+		page.search.includes("dsh_session=session-ghost"),
+		`search = ${page.search}`,
+	);
+	check(
+		"missing cell: still no dropped-session warning",
+		!page.warnings.some((line) => line.includes("unknown session id")),
+		`warnings = ${JSON.stringify(page.warnings)}`,
+	);
+	clock.restore();
+}
+
+// 9i. the sessions service itself appears AFTER apply() — the measured ordering
+{
+	// Measured on a live web profile: `ctx.get("sessions")` is `undefined` inside
+	// apply() and a real service a moment later, because the session-controller's
+	// client half lands after this plugin. Reading the service once made the session
+	// channel permanently dead on such a page (the fallback could never run), so the
+	// service is re-read on every mirror and bound when it appears.
+	resetPage({ search: "?dsh_sidebar=320&dsh_session=session-existing&token=xyz" });
+	opened = [];
+	let threw = null;
+	// No `sessions` service in the map at all: the same situation as apply() running
+	// before the controller is published.
+	const ctx = fakeCtx({ layoutStore: void 0, layout: true, slots: false });
+	const slots = makeSlots();
+	ctx.services.set("slots", slots.service);
+	const store = makeSlotStore({ sidebar: 280, viewportWidth: 1400, rightbar: null });
+	try {
+		boot(ctx);
+	} catch (error) {
+		threw = error;
+	}
+	await microtasks();
+	check("late service: apply() did not throw with no sessions service", threw === null, String(threw));
+	check(
+		"late service: nothing is erased while no session source exists",
+		page.search === "?dsh_sidebar=320&dsh_session=session-existing&token=xyz",
+		`search = ${page.search}`,
+	);
+
+	// The controller's client half now lands. The already-scheduled layout retry is
+	// what performs the next mirror; no user interaction is needed.
+	const sessions = makeSessions(
+		{ ids: ["session-live"], byId: { "session-live": { id: "session-live" } }, current: void 0 },
+		{ selection: makeSelectionStore({ sessionId: "session-live" }) },
+	);
+	ctx.services.set("sessions", sessions.service);
+	slots.set("root", [{ options: {}, component: () => null, store: makeSlotStoreHandle(store.instance) }]);
+
+	check("late service: the width was applied from the parameter", store.instance.getSnapshot().layoutInfo.sidebar === 320, `sidebar = ${store.instance.getSnapshot().layoutInfo.sidebar}`);
+	check(
+		"late service: the newly readable persisted selection reaches the URL",
+		page.search.includes("dsh_session=session-live"),
+		`search = ${page.search}`,
+	);
+	check(
+		"late service: exact URL",
+		page.search === "?dsh_sidebar=320&dsh_session=session-live&token=xyz&dsh_rightbar=0",
+		`search = ${page.search}`,
+	);
+	check(
+		"late service: localStorage was written once the session became readable",
+		storage.get("dsh.view-state.v1") !== void 0 && JSON.parse(storage.get("dsh.view-state.v1")).session === "session-live",
+		`stored = ${String(storage.get("dsh.view-state.v1"))}`,
+	);
+
+	// And a later change on the late-bound stores still re-mirrors.
+	sessions.set({ ids: ["session-live", "session-next"], byId: { "session-live": { id: "session-live" }, "session-next": { id: "session-next" } }, current: "session-next" });
+	check("late service: later changes re-mirror", page.search.includes("dsh_session=session-next"), `search = ${page.search}`);
+
+	// Unload still releases the late-bound subscription and watch.
+	const disposers = booted[booted.length - 1].effects;
+	for (const disposer of disposers) if (typeof disposer === "function") disposer();
+	check("late service: unload released the binding", page.warnings.length <= 1, `warnings = ${JSON.stringify(page.warnings)}`);
 }
 
 // ---------------------------------------------------------------------------

@@ -47,10 +47,108 @@ The service is `ctx.sessions`; it is published by the shipped client half:
 > — `service.d.ts`; the implementation is `this.manager.select(id)` (`lib/client.js`).
 > The host-side contract text is explicit that **unknown ids fail loud**.
 
+### 1.1 `list.current` is not always populated — the 0.2.1 defect
+
+**Source:** measured in a real browser profile (HarnessPortable's WebView2 leveldb,
+origin `http://127.0.0.1:3082`), then read back out of
+`dsh-api-session-controller/lib/client.js`.
+
+Both facts sat side by side in the same profile, for the same origin:
+
+```
+dsh.sessions.current = {"sessionId":"session-6ec917c4-1676-4ed0-9cdb-3313559ab9f3"}   <- the app's own persisted selection
+dsh.view-state.v1    = {"session":null,"sidebar":280,"rightbar":0}                     <- what this plugin recorded
+```
+
+The app knew the session; the plugin recorded `null`. Every saved preset therefore
+carried `dsh_session=` empty, while the two widths captured fine.
+
+The list store's own field doc says why `current` can be blank even while a
+selection exists:
+
+> `current` rides the same snapshot (arbitrated: …) — `service.d.ts`
+> "a transiently absent selection blanks `current` without moving the stage"
+> — `ClientSessions.watched` (`lib/client.js`)
+
+The durable half of that same fact is the controller's **persisted selection
+cell**, an own property on the very object provided as `ctx.sessions`:
+
+```js
+this.selection = createSnapshotStore({}, { persist: { name: "dsh.sessions.current" } });
+const restored = this.selection.getSnapshot();          // { sessionId, subagentAddress }
+this.manager = new SessionManager(remote, restored.sessionId, restored.subagentAddress);
+```
+
+— `dsh-api-session-controller/lib/client.js` (property name `selection` survives
+minification; the app itself uses `.getSnapshot().sessionId`)
+
+Its type is `private readonly selection;` (`service.d.ts`) with the doc "Private on
+purpose: reads go through the list snapshot; writes through `ClientSessions.open`
+/ `clear`." That makes this reach a **runtime** fact, not a promised API, which is
+exactly how the plugin treats it.
+
+**Read order (0.2.1):**
+
+1. `ctx.sessions.list.getSnapshot().current` — the public face, preferred.
+2. When that is not a non-empty string:
+   `ctx.sessions.selection.getSnapshot().sessionId`, only after a structural check
+   (the cell is an object with `getSnapshot`; the id is a non-empty string).
+3. Otherwise the previous semantics are unchanged: `null` when a source was
+   readable (known-absent), `undefined` when none was — so an unresolved
+   `dsh_session` is still preserved rather than erased.
+
+Reading the **cell** rather than the list is what makes the mirror agree with the
+app's own persistence: the cell is what
+`localStorage["dsh.sessions.current"]` is written from.
+
+### 1.2 The service itself arrives late — and there is no notification for it
+
+**Source:** measured on a live `0.1.5-rc.1` web profile (headless Edge over CDP,
+diagnostic probe inside `lib/client.js`). Timing of the two seats this plugin
+depends on, relative to its own `apply()`:
+
+```
+apply()                    ctx.get("sessions") = undefined      ctx.get("slots") = object
+apply() + microtask        ctx.get("sessions") = undefined
+apply() + ~1 s             ctx.get("sessions") = object  { list, manager, selection, … }
+layout store seat          present on the first 'root' probe in some boots, ~4 s later in others
+session list populated     after the layout seat in the common boot
+```
+
+So a single `ctx.get("sessions")` in `apply()` returned `undefined` on every page
+without a deep link, and since `startSessionWatch` was only called there, **no
+session subscription was ever installed** and the mirror never learned the
+selection. Both stores were reachable at ~1 s; nothing was reading them.
+
+There is no public "this service appeared" notification — that facility exists for
+the slot registry (`ctx.slots.subscribe(key, …)`) and not for services — so the
+lookup is retried on the same escalating schedule as the layout seat
+(`watchSessions()`, `LAYOUT_RETRY_DELAYS`) and the service is bound as soon as it
+appears. A missing sessions service stays a supported boot: giving up is silent,
+and the URL/localStorage channels keep working.
+
+The same measurements show why the *watch* must be able to republish on its own:
+the layout seat can be resolved before the service appears, so the last
+layout-driven mirror happened before there was anything to read, and the list
+finished loading after it. The watch therefore calls back into the mirror when it
+reaches a conclusion — including the out-of-attempts "still unknown" one — which
+is what finally published a restored selection that had been sitting in the store
+the whole time. Measured before that callback existed: store correct, URL and
+`localStorage` both `null`.
+
 **Consequences for this plugin**
 
-- Selection is read from `list.getSnapshot().current`, never from the layout store
-  (see §3).
+- Selection is read in the order above, never from the layout store (see §3).
+- The sessions service is looked up on every mirror and on a retry schedule, never
+  captured once at `apply()`.
+- Both stores are subscribed (`list.subscribe` **and** `selection.subscribe`), so a
+  selection that only the persisted cell carries — the measured case — still
+  re-mirrors. Before 0.2.1 only `list` was followed, so a change the list did not
+  report was invisible to the plugin.
+- A cell that is readable and holds no `sessionId` counts as **known-absent**, the
+  same as an empty `list.current`. A cell that is missing or wrong-shaped is
+  **unknown** — the fallback simply does not exist, and behaviour is exactly what it
+  was before this version.
 - Because `current` arrives asynchronously, an id that is not yet in `byId` is not
   yet *known* to be unknown. The plugin therefore retries on an escalating
   schedule and only drops the parameter once the list is non-empty and provably
@@ -212,7 +310,7 @@ nothing.
 
 | Fact | Where it lives | Read | Write | Exact? |
 |---|---|---|---|---|
-| selected session | `ctx.sessions.list.current` | yes | `ctx.sessions.open(id)` | yes, or fail-soft drop |
+| selected session | `ctx.sessions.list.current`, else the persisted `ctx.sessions.selection` cell (§1.1) | yes | `ctx.sessions.open(id)` | yes, or fail-soft drop |
 | sidebar px (expanded) | `layoutInfo.sidebar` | yes | `actions.setSidebar(px)` | yes, clamped by the store to `[264, 420]` |
 | sidebar collapsed | `layoutInfo.sidebar === 0` | yes | `actions.toggleSidebar()` | yes when the pre-state is known; see §4 |
 | rightbar saved px | `layoutInfo.rightbar` | yes | `actions.setRightbar(px)` | yes, clamped by the store to `[300, 0.7 × viewport]` |
@@ -388,7 +486,7 @@ second copy is never installed.
 
 | Contract item | Captured | Restored | Exactness |
 |---|---|---|---|
-| `dsh_session` | yes, from `list.current` | yes, via `open()` after `byId` validation | exact, or the parameter is dropped |
+| `dsh_session` | yes, from `list.current`, else from the persisted `sessions.selection` cell | yes, via `open()` after `byId` validation | exact, or the parameter is dropped |
 | `dsh_sidebar` = `0` | yes, `layoutInfo.sidebar === 0` | yes, via `toggleSidebar()` when the pre-state differs | exact |
 | `dsh_sidebar` = `<px>` | yes, `layoutInfo.sidebar` | yes, via `setSidebar(px)` | exact within `[264, 420]`, which is the store's own clamp |
 | `dsh_rightbar` = `<px>` | yes, `layoutInfo.rightbar` | yes, via `setRightbar(px)` | exact within `[300, 0.7 × viewport]`, re-clamped by the store |
@@ -407,11 +505,15 @@ second copy is never installed.
 - Every API claim above was read from the shipped `.js`/`.d.ts` on this machine.
 - `lib/client.js` syntax-checks under Node 24 (`node --check`).
 - `lib/index.js` is loadable ESM exporting a function `apply`.
-- 137 stub-Cordis assertions pass (`node test/client-half.test.mjs`), covering the
+- 175 stub-Cordis assertions pass (`node test/client-half.test.mjs`), covering the
   frozen contract, both fail-soft paths, the localStorage precedence rules, the
-  parameter-hygiene rules, the un-pinned-store probe, effect teardown, and both
-  0.2.0 fixes: an Nth-tick `root` seat (retried, applied, mirrored, no warning
-  before the schedule is spent) and the unknown-vs-absent rule.
+  parameter-hygiene rules, the un-pinned-store probe, effect teardown, both
+  0.2.0 fixes (an Nth-tick `root` seat — retried, applied, mirrored, no warning
+  before the schedule is spent — and the unknown-vs-absent rule), and the 0.2.1
+  fix (the session read order across both stores, their subscriptions, the
+  wrong-shaped / missing cell boundaries, a sessions service that only appears
+  after `apply()`, and the `known-absent` / `unknown` boundary when no cell
+  exists).
 - **Real browser, end to end.** Headless Edge over CDP, against a live
   `dsh --profile web --port 3081 --no-open` profile with this plugin installed;
   the client module is served from disk, so `lib/client.js` was synced into the
@@ -431,6 +533,28 @@ second copy is never installed.
   applied to the rendered frame, and **no degraded warning is emitted** in any
   case. The pre-0.2.0 behaviour of the same first row was
   `location.search = ""` plus the "panel widths cannot be restored" warning.
+
+- **Real browser, 0.2.1 (the session read order).** Same rig, fresh browser
+  profile, the app's own persisted selection put in place *before* any page script
+  runs (`Page.addScriptToEvaluateOnNewDocument`, so the measurement is not racing
+  the app's own restore):
+
+  | Boot URL | `location.search` after boot | `localStorage["dsh.view-state.v1"]` | sidebar | plugin console |
+  |---|---|---|---|---|
+  | `/` (no `dsh_*` params, `dsh.sessions.current` = a listed session) | `?dsh_sidebar=280&dsh_rightbar=0&dsh_session=<that session>` | `{"session":"<that session>","sidebar":280,"rightbar":0}` | 280 px | none |
+  | `?dsh_sidebar=320&dsh_session=<that session>` | `?dsh_sidebar=320&dsh_session=<that session>&dsh_rightbar=0` | `{"session":"<that session>","sidebar":320,"rightbar":0}` | **320 px** | none |
+  | `?dsh_sidebar=320` (session parameter absent) | `?dsh_sidebar=320&dsh_rightbar=0` | `{"session":null,"sidebar":320,"rightbar":0}` | **320 px** | none |
+
+  The first row is the defect: before 0.2.1 the same boot recorded
+  `{"session":null,…}` and carried no `dsh_session` at all, because
+  `ctx.get("sessions")` was `undefined` inside `apply()` and the selection cell was
+  therefore never read (its value, in the user's profile, was the id shown above).
+  Sampled repeatedly for 30 s in that same run, the store's session first appears
+  at ~12–20 s (the list load), and the URL/localStorage pick it up in the same
+  tick — the watch's own republish, not a later user action. The `token` parameter
+  is consumed by the app's own redirect on the very first navigation, which is why
+  it is absent from every `location.search` above; a later navigation that carries
+  it behaves as the first 0.2.0 table already proves.
 
 **Not verified here**
 

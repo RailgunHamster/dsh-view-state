@@ -1,6 +1,6 @@
 # dsh-view-state
 
-[![test](https://img.shields.io/badge/test-137%20assertions%20passing-brightgreen)](#测试) · [English](README.md)
+[![test](https://img.shields.io/badge/test-175%20assertions%20passing-brightgreen)](#测试) · [English](README.md)
 
 **让 DeepSeek Harness（`dsh`）Web UI 的「每标签页视图状态」可被外部寻址。**
 
@@ -61,6 +61,48 @@ CSS**。
   `null` 解释为「删除该参数」。于是包装器传入的 `?dsh_sidebar=320` 在启动窗口内
   被页面删除，`location.search` 最终为空。现在每个事实都显式携带「是否已知」，
   只有确知缺失时才删除参数。
+
+### 0.2.1 改了什么
+
+一个缺陷，靠直接证据（而非推理）确认，它正是「保存的预设里没有会话」的原因。
+在真实浏览器 profile（WebView2 leveldb，源 `http://127.0.0.1:3082`）中实测到
+同一个源的这两个键：
+
+```
+dsh.sessions.current = {"sessionId":"session-6ec917c4-…"}   <- 应用自己持久化的选择
+dsh.view-state.v1    = {"session":null,"sidebar":280,"rightbar":0}   <- 本插件记录的内容
+```
+
+应用知道会话，插件却记录了 `null`，于是采集到的预设每个标签页的 `dsh_session=`
+都是空的，而两个宽度却采集正常 —— 也就是「重新打开布局不会回到我原来的对话」。
+
+要让这件事成立，三项实测事实必须对齐；每一项都用带诊断代码的本插件在真实 web
+profile 上验证过：
+
+1. **选中会话时 `list.current` 可能为空。** 公开 list store 的字段注释称之为
+   *transiently absent selection*。持久化的值存放在会话控制器的**持久化选择单元**
+   里 —— 它是 `ctx.sessions` 这个对象自身的属性：
+   `ctx.sessions.selection.getSnapshot().sessionId`。
+2. **本插件激活时 `sessions` 服务尚未发布。** 实测：`apply()` 内
+   `ctx.get("sessions")` 是 `undefined`，约 1 秒后才是真实服务。因此只读取一次会
+   让插件整页都没有会话数据源、也没有任何订阅。
+3. **list 可能在上一次镜像之后才加载完成。** 布局座席约 4 秒就位，而会话列表更晚
+   才加载完，于是 store 终于拿到数据时，已经没有任何东西会重新发布它。
+
+现在插件按固定顺序读取，服务一出现就绑定，并在自己的 watch 得出结论时重新发布：
+
+1. `ctx.sessions.list.getSnapshot().current` —— 公开读面，优先；
+2. 当它不是非空字符串时，读取持久化单元
+   `ctx.sessions.selection.getSnapshot().sessionId`，并做结构校验（对象且有
+   `getSnapshot`，id 为非空字符串）；
+3. 否则与之前语义完全一致：未知仍是未知，因此已有的 `dsh_session` 参数会被保留，
+   而不是被删除。
+
+两个 store 都会被订阅；`sessions` 服务在每次镜像以及递增重试计划中都会被重新读取
+—— 公开 API 里没有「服务出现」的通知，这与布局座席本来就需要的那套重试是同一套。
+此前所有保证不变：只用 `replaceState`、pathname 不动、外来参数按字节保留、软失败、
+无 UI/DOM/CSS。这些回退都只是被守卫的**运行时**触达，而不是承诺：若未来版本移除了
+该属性或该服务，行为与 0.2.0 完全一致。
 
 ---
 
@@ -180,10 +222,21 @@ webView.Source = new Uri(restored);
   ui-layout 始终不注册被钉住的 store，宽度恢复会退化为一条警告 —— **在重试计划
   用尽之后**（约 7.5 秒）—— 而 URL / localStorage 双向镜像仍继续工作。见
   [`docs/API-NOTES.md` §2.3](docs/API-NOTES.md)。
+- **读取选中会话依赖一项运行时细节。** 公开读面是
+  `sessions.list.getSnapshot().current`；在实测出现该字段被清空的页面上，插件回退到
+  会话控制器自身的持久化选择单元 `sessions.selection.getSnapshot().sessionId` ——
+  这是控制器声明为 `private` 的内部属性。插件会做结构探测，属性缺失或形状不对时
+  什么都不做，因此未来版本若移除它，行为只会退回到与 0.2.0 完全一致，而不会出错。
+  `sessions` 服务同样是在每次镜像以及递增重试计划中通过 `ctx.get()` 重新读取的，
+  因为它是在本插件激活**之后**才发布的（实测：`apply()` 内为 `undefined`，约 1 秒
+  后才是服务）。
 - **已在真实浏览器中验证**（headless Edge + CDP，真实 web profile 且已安装插件）：
   `?dsh_sidebar=320` 恢复出约 320 px 的侧边栏且该参数在整个启动过程中存活；
   `?dsh_sidebar=0` 折叠为约 56 px 的窄轨；不带任何参数加载则镜像 store 自身的
-  默认值。见 [`docs/API-NOTES.md` §7](docs/API-NOTES.md)。
+  默认值（0.2.0）；在加载前把应用自身的持久化选择放好后，普通刷新会把该会话发布到
+  URL 与 `localStorage` —— 而 0.2.0 在这里记录的是 `null` —— 同时
+  `?dsh_sidebar=320&dsh_session=<id>` 依然能完整往返（0.2.1）。见
+  [`docs/API-NOTES.md` §7](docs/API-NOTES.md)。
 
 ---
 
@@ -193,15 +246,17 @@ webView.Source = new Uri(restored);
 node test/client-half.test.mjs     # 或：npm test
 ```
 
-137 条断言，零依赖，无需浏览器：用一份手写的假 `ctx`（服务 `sessions`、
+175 条断言，零依赖，无需浏览器：用一份手写的假 `ctx`（服务 `sessions`、
 `layout`、`slots`，以及 `effect`）加载真实的 `lib/client.js`，并配合
 `window`、`history`、`localStorage` 以及一对可控的 `setTimeout`/`clearTimeout`
 替身。覆盖内容：冻结契约、精确的 URL 字符串结果、pathname 保留、`token` 保留与
 外来参数的字节级不变、未知 id 丢弃、localStorage 回退与优先级、未钉住 store 的
-探测，以及 effect 卸载 —— 外加 0.2.0 的两处修复：`root` 插槽只在第 N 个 tick
-出现（宽度被读取、应用、镜像，且在重试耗尽前不发警告），以及「未知 vs null」
-规则（未知事实绝不删除参数，确知缺失仍然删除）。每个用例都会先卸载自己的 fiber，
-因此退役的重试定时器绝不会泄漏到下一条断言。
+探测，以及 effect 卸载 —— 外加 0.2.0 的两处修复（`root` 插槽只在第 N 个 tick
+出现：宽度被读取、应用、镜像，且在重试耗尽前不发警告；以及「未知 vs null」规则）
+与 0.2.1 的修复（跨 list 与持久化选择单元的读取顺序、两个 store 的订阅 —— 包括
+完全不触碰 `list.current` 的选择变化、`apply()` 之后才出现的 `sessions` 服务、
+形状错误 / 单元缺失时的边界，以及最终的精确 URL）。每个用例都会先卸载自己的
+fiber，因此退役的重试定时器绝不会泄漏到下一条断言。
 
 ---
 

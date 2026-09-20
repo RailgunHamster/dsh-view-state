@@ -1,6 +1,6 @@
 # dsh-view-state
 
-[![test](https://img.shields.io/badge/test-137%20assertions%20passing-brightgreen)](#testing) · [中文](README.zh.md)
+[![test](https://img.shields.io/badge/test-175%20assertions%20passing-brightgreen)](#testing) · [中文](README.zh.md)
 
 **Addressable per-tab view state for the DeepSeek Harness (`dsh`) web UI.**
 
@@ -73,6 +73,55 @@ Two independent defects, both proven in a real browser:
   `?dsh_sidebar=320` was therefore deleted by the page during the boot window, and
   `location.search` came back empty. Facts now carry an explicit knownness, and a
   parameter is only ever removed when the fact is known to be absent.
+
+### What changed in 0.2.1
+
+One defect, proven by direct evidence rather than reasoning, and it is why saved
+presets carried no session. Measured in a real browser profile (WebView2 leveldb,
+origin `http://127.0.0.1:3082`), two keys for the same origin:
+
+```
+dsh.sessions.current = {"sessionId":"session-6ec917c4-…"}   <- the app's own persisted selection
+dsh.view-state.v1    = {"session":null,"sidebar":280,"rightbar":0}   <- what this plugin recorded
+```
+
+The app knew the session; the plugin recorded `null`, so each captured preset had
+`dsh_session=` empty on every tab while the widths captured fine — "reopening a
+layout does not remember which conversation I was in".
+
+Three measured facts had to line up, and each was verified on a live web profile
+with a diagnostic build of this plugin:
+
+1. **`list.current` can be blank while a session is selected.** The public list
+   store's own field doc calls it a *transiently absent selection*. The durable
+   value lives in the session controller's **persisted selection cell**, an own
+   property on the very object provided as `ctx.sessions`:
+   `ctx.sessions.selection.getSnapshot().sessionId`.
+2. **The `sessions` service is not published yet when this plugin activates.**
+   Measured: `ctx.get("sessions")` is `undefined` inside `apply()` and a real
+   service ~1 s later. A single lookup therefore left the plugin with no session
+   source and no subscription for the whole page life.
+3. **The list can finish loading after the last mirror.** The layout seat is
+   resolved around 4 s and the session list loaded later still, so nothing
+   republished the selection once the store finally had it.
+
+The plugin now reads the selection in a fixed order, binds the service whenever it
+appears, and republishes when its own watch concludes:
+
+1. `ctx.sessions.list.getSnapshot().current` — the public face, preferred;
+2. when that is not a non-empty string, the persisted cell
+   `ctx.sessions.selection.getSnapshot().sessionId`, structurally validated
+   (an object with `getSnapshot`, and a non-empty string id);
+3. otherwise exactly the previous semantics: unknown stays unknown, so an
+   existing `dsh_session` parameter is preserved rather than removed.
+
+Both stores are subscribed, and the sessions service is re-read on every mirror and
+on an escalating retry schedule — there is no public notification for "a service
+appeared", so this is the same retry the layout seat already needed. Every earlier
+guarantee is unchanged: `replaceState` only, the pathname untouched, foreign
+parameters byte-exact, fail-soft, no UI/DOM/CSS. The fallbacks are guarded
+*runtime* reaches, never promises: if a future version drops the property or the
+service, behaviour is exactly what it was in 0.2.0.
 
 ---
 
@@ -205,10 +254,23 @@ underlying API facts are in [`docs/API-NOTES.md`](docs/API-NOTES.md).
   a single warning — **after** the retry schedule is exhausted, ~7.5 s — and the
   URL/localStorage mirroring keeps working. See
   [`docs/API-NOTES.md` §2.3](docs/API-NOTES.md).
+- **Reading the selected session depends on one runtime detail.** The public face
+  is `sessions.list.getSnapshot().current`, and on a page where that field is
+  blanked (measured) the plugin falls back to the session controller's own
+  persisted selection cell, `sessions.selection.getSnapshot().sessionId` — an
+  internal property the controller declares `private`. The plugin probes it
+  structurally and does nothing when it is missing or wrong-shaped, so a future
+  version that drops it degrades to exactly the 0.2.0 behaviour rather than
+  breaking. The `sessions` service is also looked up through `ctx.get()` on every
+  mirror plus a retry schedule, because it is published *after* this plugin
+  activates (measured: `undefined` in `apply()`, a service ~1 s later).
 - **Verified in a real browser** (headless Edge over CDP, live web profile,
   plugin installed): `?dsh_sidebar=320` restores a ≈320 px sidebar and the
   parameter survives the boot; `?dsh_sidebar=0` collapses to the ≈56 px rail; a
-  parameterless load mirrors the store's own default. See
+  parameterless load mirrors the store's own default (0.2.0); and with the app's
+  persisted selection in place before load, a plain reload publishes that session
+  into the URL and `localStorage` where 0.2.0 recorded `null`, while
+  `?dsh_sidebar=320&dsh_session=<id>` still round-trips (0.2.1). See
   [`docs/API-NOTES.md` §7](docs/API-NOTES.md).
 
 ---
@@ -219,18 +281,20 @@ underlying API facts are in [`docs/API-NOTES.md`](docs/API-NOTES.md).
 node test/client-half.test.mjs     # or: npm test
 ```
 
-137 assertions, no dependencies, no browser: the real `lib/client.js` is loaded
+175 assertions, no dependencies, no browser: the real `lib/client.js` is loaded
 through a hand-written fake `ctx` (services `sessions`, `layout`, `slots`, plus
 `effect`), with `window`, `history`, `localStorage` and a controllable
 `setTimeout`/`clearTimeout` pair. It covers the frozen contract, the exact
 resulting URL strings, pathname preservation, `token` preservation and byte-exact
 foreign parameters, unknown-id drop, storage fallback and precedence, the
-un-pinned-store probe, and effect teardown — plus the two 0.2.0 fixes: a `root`
-slot that appears only on the Nth tick (widths read, applied, mirrored, and no
-warning before the retries are spent), and the unknown-vs-null rule (an unknown
-fact never removes a parameter, a known-absent fact still does). Every block
-disposes its fiber first, so a retired retry timer can never leak into the next
-assertion.
+un-pinned-store probe, and effect teardown — plus the two 0.2.0 fixes (a `root`
+slot that appears only on the Nth tick: widths read, applied, mirrored, and no
+warning before the retries are spent; and the unknown-vs-null rule) and the 0.2.1
+fix (the session read order across the list and the persisted selection cell, both
+subscriptions including a selection change that never touches `list.current`, a
+sessions service that only appears after `apply()`, the wrong-shaped / missing cell
+boundaries, and the exact resulting URLs). Every block disposes its fiber first, so
+a retired retry timer can never leak into the next assertion.
 
 ---
 
