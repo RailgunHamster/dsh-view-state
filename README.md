@@ -1,6 +1,6 @@
 # dsh-view-state
 
-[![test](https://img.shields.io/badge/test-101%20assertions%20passing-brightgreen)](#testing) · [中文](README.zh.md)
+[![test](https://img.shields.io/badge/test-137%20assertions%20passing-brightgreen)](#testing) · [中文](README.zh.md)
 
 **Addressable per-tab view state for the DeepSeek Harness (`dsh`) web UI.**
 
@@ -37,14 +37,42 @@ Rules the plugin guarantees:
 2. **Foreign parameters are preserved byte-for-byte and in order.** `token`, in
    particular, is never decoded, re-encoded or reordered: it is what the server
    authenticated against.
-3. Unparsable and negative widths are treated as **absent**, not as `0`.
-4. The URL wins over `localStorage` when both carry a value; `localStorage` fills
+3. **Unknown is not absent.** A fact nobody has read yet (the layout store has
+   not mounted, the session list has not loaded) leaves its parameter **exactly
+   as supplied**. A parameter is removed only when its fact is *known* to be
+   absent — e.g. a session list that has loaded and provably lacks the id.
+   Erasing a wrapper's `?dsh_sidebar=320` because our first read happened too
+   early would be data loss, not a degrade path.
+4. **Reachability is retried, never sampled once.** `ui-layout` registers the
+   pinned layout store on the `root` slot *after* this plugin activates, so the
+   plugin waits for the registry's own change notification
+   (`ctx.slots.subscribe("root", …)`) with an escalating polling fallback, then
+   applies the requested widths. The "widths cannot be restored" warning is
+   emitted **once, and only after that schedule is exhausted**.
+5. Unparsable and negative widths are treated as **absent**, not as `0`.
+6. The URL wins over `localStorage` when both carry a value; `localStorage` fills
    the gaps the URL left. A URL that already matches the live state is **not
    rewritten at all**.
-5. Unknown session ids **fail soft**: only that parameter is dropped; everything
+7. Unknown session ids **fail soft**: only that parameter is dropped; everything
    else keeps working.
-6. Every missing service, missing slot or thrown error is swallowed. At most
+8. Every missing service, missing slot or thrown error is swallowed. At most
    **one** `console.warn` is emitted per activation.
+
+### What changed in 0.2.0
+
+Two independent defects, both proven in a real browser:
+
+- **Retry-based reachability.** The plugin used to probe `ctx.slots.entries("root")`
+  exactly once, synchronously, inside `apply()`. Measured on a live
+  `0.1.5-rc.1` web profile, that probe is always empty — `ui-layout` registers the
+  seat ~4 s later — so the one attempt failed, the plugin warned, and no width was
+  ever applied. It now waits for the seat (registry notification + escalating
+  polling) and applies the requested state when it arrives.
+- **Unknown ≠ null.** An unread fact used to be published as `null`, which the URL
+  writer interprets as "remove this parameter". A wrapper-supplied
+  `?dsh_sidebar=320` was therefore deleted by the page during the boot window, and
+  `location.search` came back empty. Facts now carry an explicit knownness, and a
+  parameter is only ever removed when the fact is known to be absent.
 
 ---
 
@@ -170,12 +198,17 @@ underlying API facts are in [`docs/API-NOTES.md`](docs/API-NOTES.md).
   and local.
 - **Reaching the layout store depends on an implementation detail.** The plugin
   gets the live store from the `store` seat on the `root` slot registration and
-  verifies it is pinned (two `create()` calls must return the same object). If a
-  future ui-layout stops pinning it, width restore degrades to a single warning
-  and the URL/localStorage mirroring keeps working. See
+  verifies it is pinned (two `create()` calls must return the same object). The
+  seat is registered *after* this plugin activates (measured: `entries("root")`
+  is empty inside `apply()`, one entry ~4 s later), so the plugin waits for it.
+  If a future ui-layout never registers a pinned store, width restore degrades to
+  a single warning — **after** the retry schedule is exhausted, ~7.5 s — and the
+  URL/localStorage mirroring keeps working. See
   [`docs/API-NOTES.md` §2.3](docs/API-NOTES.md).
-- **Not verified in a real browser.** This repository has a stub-Cordis test
-  suite; real WebView behaviour was not exercised here. See
+- **Verified in a real browser** (headless Edge over CDP, live web profile,
+  plugin installed): `?dsh_sidebar=320` restores a ≈320 px sidebar and the
+  parameter survives the boot; `?dsh_sidebar=0` collapses to the ≈56 px rail; a
+  parameterless load mirrors the store's own default. See
   [`docs/API-NOTES.md` §7](docs/API-NOTES.md).
 
 ---
@@ -186,12 +219,18 @@ underlying API facts are in [`docs/API-NOTES.md`](docs/API-NOTES.md).
 node test/client-half.test.mjs     # or: npm test
 ```
 
-101 assertions, no dependencies, no browser: the real `lib/client.js` is loaded
+137 assertions, no dependencies, no browser: the real `lib/client.js` is loaded
 through a hand-written fake `ctx` (services `sessions`, `layout`, `slots`, plus
-`effect`), with `window`, `history` and `localStorage` shims. It covers the frozen
-contract, the exact resulting URL strings, pathname preservation, `token`
-preservation and byte-exact foreign parameters, unknown-id drop, storage
-fallback and precedence, the un-pinned-store probe, and effect teardown.
+`effect`), with `window`, `history`, `localStorage` and a controllable
+`setTimeout`/`clearTimeout` pair. It covers the frozen contract, the exact
+resulting URL strings, pathname preservation, `token` preservation and byte-exact
+foreign parameters, unknown-id drop, storage fallback and precedence, the
+un-pinned-store probe, and effect teardown — plus the two 0.2.0 fixes: a `root`
+slot that appears only on the Nth tick (widths read, applied, mirrored, and no
+warning before the retries are spent), and the unknown-vs-null rule (an unknown
+fact never removes a parameter, a known-absent fact still does). Every block
+disposes its fiber first, so a retired retry timer can never leak into the next
+assertion.
 
 ---
 

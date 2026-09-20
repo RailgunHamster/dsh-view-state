@@ -126,8 +126,33 @@ function check(label, condition, detail) {
 	console.log(`FAIL  ${label}${detail === void 0 ? "" : `\n        ${detail}`}`);
 }
 
+/** Every ctx handed to boot(), so each block starts from a clean page. */
+const booted = [];
+
+/**
+ * Dispose every fiber booted so far, the way Cordis would on plugin unload.
+ *
+ * This matters more than it used to: reachability is now retried
+ * asynchronously, so a boot from an earlier block could otherwise still have a
+ * timer pending (and warn, or write) while a later block is asserting.
+ */
+function disposeBooted() {
+	const list = booted.splice(0, booted.length);
+	for (const ctx of list) {
+		for (const disposer of ctx.effects ?? []) {
+			if (typeof disposer !== "function") continue;
+			try {
+				disposer();
+			} catch {
+				/* ignore */
+			}
+		}
+	}
+}
+
 /** Reset everything that describes a single boot. */
 function resetPage({ pathname = "/", search = "", hash = "", clearStorage = true } = {}) {
+	disposeBooted();
 	page.pathname = pathname;
 	page.search = search;
 	page.hash = hash;
@@ -225,12 +250,95 @@ function makeSessions(initial) {
 let opened = [];
 
 /**
+ * A fake slots registry with the two public reads the plugin uses: `entries(key)`
+ * and the change notification `subscribe(key, fn)`.
+ *
+ * The real registry batches notifications on a microtask; this one is
+ * synchronous so a test can drive "the root slot appears on the Nth tick"
+ * deterministically.
+ */
+function makeSlots() {
+	const registry = new Map();
+	const listeners = new Map();
+	return {
+		service: {
+			entries: (key) => registry.get(key) ?? [],
+			subscribe(key, fn) {
+				if (!listeners.has(key)) listeners.set(key, new Set());
+				listeners.get(key).add(fn);
+				return () => {
+					listeners.get(key)?.delete(fn);
+				};
+			},
+		},
+		/** Register the entries for a key and notify that key's subscribers. */
+		set(key, entries) {
+			registry.set(key, entries);
+			for (const fn of [...(listeners.get(key) ?? [])]) fn();
+		},
+		listenerCount: (key) => (listeners.get(key) ?? new Set()).size,
+	};
+}
+
+/** Drain the microtask queue (the plugin's delay-0 retry hops through it). */
+async function microtasks(times = 12) {
+	for (let i = 0; i < times; i += 1) await Promise.resolve();
+}
+
+/**
+ * A controllable `setTimeout`/`clearTimeout` pair.
+ *
+ * Retry schedules are asserted by driving the clock rather than by sleeping:
+ * `tick(n)` runs the next n scheduled callbacks, `flush()` runs the rest
+ * (including timers scheduled while running), and `pending()` counts the ones
+ * that are still armed — which is how "reaching the store cancels the fallback
+ * polling" is observed.
+ */
+function installFakeClock() {
+	const realSetTimeout = globalThis.setTimeout;
+	const realClearTimeout = globalThis.clearTimeout;
+	const queue = [];
+	let seq = 0;
+	globalThis.setTimeout = (fn, delay) => {
+		const handle = { id: (seq += 1), fn, delay, cancelled: false, ran: false };
+		queue.push(handle);
+		return handle;
+	};
+	globalThis.clearTimeout = (handle) => {
+		if (handle !== null && typeof handle === "object") handle.cancelled = true;
+	};
+	return {
+		queue,
+		pending: () => queue.filter((h) => !h.cancelled && !h.ran).length,
+		/** Run the next `count` armed callbacks; false when none are left. */
+		tick(count = 1) {
+			for (let i = 0; i < count; i += 1) {
+				const next = queue.find((h) => !h.cancelled && !h.ran);
+				if (next === void 0) return false;
+				next.ran = true;
+				next.fn();
+			}
+			return true;
+		},
+		flush() {
+			while (this.tick(1)) {
+				/* run the whole schedule */
+			}
+		},
+		restore() {
+			globalThis.setTimeout = realSetTimeout;
+			globalThis.clearTimeout = realClearTimeout;
+		},
+	};
+}
+
+/**
  * Build a fake client context.
  *
  * Services are optional on purpose — the plugin must survive without any of
  * them, so the test constructs ctxs with arbitrary subsets.
  */
-function fakeCtx({ sessions, layoutStore, layout = true, slots = true, get = true } = {}) {
+function fakeCtx({ sessions, layoutStore, layout = true, slots = true, slotsService, get = true } = {}) {
 	const effects = [];
 	const ctx = {
 		services: new Map(),
@@ -254,9 +362,12 @@ function fakeCtx({ sessions, layoutStore, layout = true, slots = true, get = tru
 	}
 	if (sessions !== void 0) ctx.services.set("sessions", sessions);
 	if (layout) ctx.services.set("layout", { selectPanel() {}, toggleSidebar() {}, openRightbar() {}, closeRightbar() {}, beginNavigation: () => new AbortController().signal });
-	if (slots && layoutStore !== void 0) {
+	if (slotsService !== void 0) {
+		ctx.services.set("slots", slotsService);
+	} else if (slots && layoutStore !== void 0) {
 		ctx.services.set("slots", {
 			entries: (key) => (key === "root" ? [{ options: {}, component: () => null, store: layoutStore }] : []),
+			subscribe: () => () => {},
 		});
 	}
 	return ctx;
@@ -271,9 +382,11 @@ const pluginExports = (() => {
 	return returned ?? module.exports;
 })();
 
-/** Run one boot of apply() against a ctx. */
+/** Run one boot of apply() against a ctx (and remember it for teardown). */
 function boot(ctx) {
+	booted.push(ctx);
 	pluginExports.apply(ctx);
+	return ctx;
 }
 
 // ---------------------------------------------------------------------------
@@ -510,9 +623,13 @@ check(
 		current: void 0,
 	});
 	check("late id: opened once the list can prove it exists", opened.length === 1 && opened[0] === "session-late", `opened = ${JSON.stringify(opened)}`);
+	// The parameter survived the whole unknown window and keeps its original
+	// position; the panel facts, which are known as soon as the store is
+	// reachable, are appended. (Before the retry fix this boot erased
+	// `dsh_session` outright and only re-added it later, at the end.)
 	check(
-		"late id: mirrored",
-		lastReplace() === "/?dsh_sidebar=280&dsh_rightbar=0&dsh_session=session-late",
+		"late id: never erased, then mirrored in place",
+		lastReplace() === "/?dsh_session=session-late&dsh_sidebar=280&dsh_rightbar=0",
 		`url = ${String(lastReplace())}`,
 	);
 	check("late id: the session parameter is present", lastReplace() !== null && lastReplace().includes("dsh_session=session-late"));
@@ -531,9 +648,11 @@ check(
 		current: "session-other",
 	});
 	check("never-listed id: never opened", opened.length === 0, `opened = ${JSON.stringify(opened)}`);
+	// Once the list has loaded, `current` (session-other) is a real reading, so
+	// the parameter is refreshed in place with the session the page is showing.
 	check(
-		"never-listed id: dropped from the URL",
-		lastReplace() === "/?dsh_sidebar=280&dsh_rightbar=0&dsh_session=session-other",
+		"never-listed id: replaced by the live selection, in place",
+		lastReplace() === "/?dsh_session=session-other&dsh_sidebar=280&dsh_rightbar=0",
 		`url = ${String(lastReplace())}`,
 	);
 }
@@ -553,15 +672,21 @@ check(
 	}
 	check("no services: apply() did not throw", threw === null, String(threw));
 	check("no services: at most one warning", page.warnings.length <= 1, `warnings = ${JSON.stringify(page.warnings)}`);
-	// With no layout store there is no reading to take, so the panel parameters
-	// are left exactly as they were rather than being overwritten with guesses;
-	// the session parameter is dropped because no session can be selected.
+	// With no services at all, every fact is UNKNOWN rather than absent. Unknown
+	// is not "null": the caller's parameters are left byte-for-byte as supplied
+	// instead of being erased with guesses (the old single-probe behaviour wrote
+	// `/?token=xyz` here, which deleted a wrapper's own deep link).
 	check(
-		"no services: foreign params survive and panel params are left alone",
-		lastReplace() === "/?token=xyz",
+		"no services: nothing is erased while every fact is unknown",
+		lastReplace() === null,
 		`url = ${String(lastReplace())}`,
 	);
-	check("no services: token preserved", lastReplace() !== null && lastReplace().includes("token=xyz"));
+	check(
+		"no services: the caller's parameters are byte-identical",
+		page.search === "?dsh_session=session-abc&dsh_sidebar=0&dsh_rightbar=320&token=xyz",
+		`search = ${page.search}`,
+	);
+	check("no services: token preserved", page.search.includes("token=xyz"), `search = ${page.search}`);
 }
 
 // --- a ctx with no get() at all (an older/leaner context) ---
@@ -576,9 +701,10 @@ check(
 	check("ctx without get(): apply() did not throw", threw === null, String(threw));
 }
 
-// --- a slots service that throws, and a layout store that is not pinned ---
+// --- a slots service that throws: degrade, but only after the retries are spent ---
 {
 	resetPage({ search: "?dsh_sidebar=0&dsh_rightbar=320" });
+	const clock = installFakeClock();
 	let threw = null;
 	const ctx = fakeCtx({ sessions: void 0, layout: true, slots: false });
 	ctx.services.set("slots", {
@@ -591,13 +717,24 @@ check(
 	} catch (error) {
 		threw = error;
 	}
+	await microtasks();
 	check("throwing slots registry: apply() did not throw", threw === null, String(threw));
-	check("throwing slots registry: degrades to a warning", page.warnings.length <= 1, `warnings = ${JSON.stringify(page.warnings)}`);
+	check("throwing slots registry: no warning on the first failed probe", page.warnings.length === 0, `warnings = ${JSON.stringify(page.warnings)}`);
+	check("throwing slots registry: the caller's parameters were not erased", page.search === "?dsh_sidebar=0&dsh_rightbar=320", `search = ${page.search}`);
+	clock.flush();
+	check(
+		"throwing slots registry: exactly one warning once the retries are spent",
+		page.warnings.length === 1 && page.warnings[0].includes("panel widths cannot be restored"),
+		`warnings = ${JSON.stringify(page.warnings)}`,
+	);
+	check("throwing slots registry: still no erasure after giving up", page.search === "?dsh_sidebar=0&dsh_rightbar=320", `search = ${page.search}`);
+	clock.restore();
 }
 
 // --- a store whose create() does NOT return the same object (not pinned) ---
 {
 	resetPage({ search: "?dsh_sidebar=0" });
+	const clock = installFakeClock();
 	let threw = null;
 	let freshCalls = 0;
 	const ctx = fakeCtx({ sessions: void 0, layout: true, slots: false });
@@ -623,9 +760,22 @@ check(
 	} catch (error) {
 		threw = error;
 	}
+	await microtasks();
 	check("un-pinned store: apply() did not throw", threw === null, String(threw));
-	check("un-pinned store: probe rejected it (create() called twice to test)", freshCalls === 2, `create() calls = ${freshCalls}`);
-	check("un-pinned store: width left unrestored and reported", page.warnings.length === 1, `warnings = ${JSON.stringify(page.warnings)}`);
+	check("un-pinned store: no warning before the retries are spent", page.warnings.length === 0, `warnings = ${JSON.stringify(page.warnings)}`);
+	clock.flush();
+	check(
+		"un-pinned store: probe rejected it on every attempt (create() pairs)",
+		freshCalls >= 2 && freshCalls % 2 === 0,
+		`create() calls = ${freshCalls}`,
+	);
+	check(
+		"un-pinned store: width left unrestored and reported exactly once",
+		page.warnings.length === 1 && page.warnings[0].includes("panel widths cannot be restored"),
+		`warnings = ${JSON.stringify(page.warnings)}`,
+	);
+	check("un-pinned store: the caller's parameter was not erased", page.search === "?dsh_sidebar=0", `search = ${page.search}`);
+	clock.restore();
 }
 
 // ---------------------------------------------------------------------------
@@ -887,6 +1037,155 @@ check(
 	check("retry: nothing threw while the list stayed empty", threw === null);
 	check("retry: no session was opened for an unresolvable id", opened.length === 0, `opened = ${JSON.stringify(opened)}`);
 	check("retry: no warning for an id that is merely unresolved", page.warnings.length === 0, `warnings = ${JSON.stringify(page.warnings)}`);
+}
+
+// ---------------------------------------------------------------------------
+// 8. retry-based reachability — the root seat arrives AFTER apply()
+// ---------------------------------------------------------------------------
+
+// The measured real-world boot: inside apply() `ctx.slots.entries("root")` is
+// empty, and the pinned store shows up seconds later. A single synchronous probe
+// therefore must not be treated as final, and must not erase anything.
+
+// 8a. the root slot appears only on the Nth tick
+{
+	resetPage({ search: "?dsh_sidebar=320&token=xyz" });
+	const clock = installFakeClock();
+	const slots = makeSlots();
+	const store = makeSlotStore({ sidebar: 280, viewportWidth: 1400, rightbar: null });
+	boot(fakeCtx({ sessions: void 0, slotsService: slots.service }));
+
+	// First probe is empty (the registry has no 'root' entry yet).
+	await microtasks();
+	check("retry store: no degraded warning while the root slot is still empty", page.warnings.length === 0, `warnings = ${JSON.stringify(page.warnings)}`);
+	check("retry store: no reading was taken, so nothing was written", page.replaceCalls.length === 0, `calls = ${JSON.stringify(page.replaceCalls)}`);
+	check("retry store: the caller's parameters are untouched", page.search === "?dsh_sidebar=320&token=xyz", `search = ${page.search}`);
+	check("retry store: the registry change subscription is installed", slots.listenerCount("root") === 1, `listeners = ${slots.listenerCount("root")}`);
+
+	// Two more empty polls go by. Still nothing known, still nothing erased, and
+	// — the part the old single-probe code got wrong — still no warning.
+	clock.tick(2);
+	check("retry store: still no warning after empty ticks", page.warnings.length === 0, `warnings = ${JSON.stringify(page.warnings)}`);
+	check("retry store: still nothing erased after empty ticks", page.search === "?dsh_sidebar=320&token=xyz", `search = ${page.search}`);
+	check("retry store: a fallback poll is still armed", clock.pending() >= 1, `pending = ${clock.pending()}`);
+
+	// ui-layout finally registers its seat.
+	slots.set("root", [{ options: {}, component: () => null, store: makeSlotStoreHandle(store.instance) }]);
+	check("retry store: the width was applied once the seat appeared", store.instance.getSnapshot().layoutInfo.sidebar === 320, `sidebar = ${store.instance.getSnapshot().layoutInfo.sidebar}`);
+	check("retry store: the newly known facts were mirrored", page.search === "?dsh_sidebar=320&token=xyz&dsh_rightbar=0", `search = ${page.search}`);
+	check("retry store: reaching the store cancelled the fallback polling", clock.pending() === 0, `pending = ${clock.pending()}`);
+	check("retry store: no warning at all in the happy path", page.warnings.length === 0, `warnings = ${JSON.stringify(page.warnings)}`);
+
+	// And the store is live thereafter: a real resize is mirrored.
+	store.actions.setSidebar(360);
+	check("retry store: later layout commits are mirrored", page.search.includes("dsh_sidebar=360"), `search = ${page.search}`);
+	clock.restore();
+}
+
+// 8b. the seat never appears: the warning comes once, only after every retry
+{
+	resetPage({ search: "?dsh_sidebar=320&token=xyz" });
+	const clock = installFakeClock();
+	const slots = makeSlots();
+	boot(fakeCtx({ sessions: void 0, slotsService: slots.service }));
+	await microtasks();
+	check("exhausted: no warning on the first failed probe", page.warnings.length === 0, `warnings = ${JSON.stringify(page.warnings)}`);
+	check("exhausted: nothing was erased while the facts are unknown", page.search === "?dsh_sidebar=320&token=xyz", `search = ${page.search}`);
+	clock.flush();
+	check(
+		"exhausted: exactly one warning, and only after the retries are spent",
+		page.warnings.length === 1 && page.warnings[0].includes("panel widths cannot be restored"),
+		`warnings = ${JSON.stringify(page.warnings)}`,
+	);
+	check("exhausted: the parameter is STILL not erased after giving up", page.search === "?dsh_sidebar=320&token=xyz", `search = ${page.search}`);
+	check("exhausted: no timer is left armed", clock.pending() === 0, `pending = ${clock.pending()}`);
+	clock.restore();
+}
+
+// 8c. UNKNOWN is not null: an unresolvable boot must not delete the caller's
+//     parameters (this is the defect that erased `dsh_sidebar=320` in a browser)
+{
+	resetPage({ search: "?dsh_session=session-late&dsh_sidebar=320&dsh_rightbar=420&token=xyz" });
+	const clock = installFakeClock();
+	const slots = makeSlots();
+	// The list has not loaded, and the registry has no root entry: all three
+	// facts are unknown.
+	const sessions = makeSessions({ ids: [], byId: {}, current: void 0 });
+	boot(fakeCtx({ sessions: sessions.service, slotsService: slots.service }));
+	await microtasks();
+	clock.tick(2);
+	check("unknown: nothing was written at all", page.replaceCalls.length === 0, `calls = ${JSON.stringify(page.replaceCalls)}`);
+	check(
+		"unknown: every parameter is byte-identical to what the caller supplied",
+		page.search === "?dsh_session=session-late&dsh_sidebar=320&dsh_rightbar=420&token=xyz",
+		`search = ${page.search}`,
+	);
+	check("unknown: storage was not blanked either", (() => {
+		const raw = storage.get("dsh.view-state.v1");
+		if (raw === void 0) return true;
+		const parsed = JSON.parse(raw);
+		return parsed.sidebar === 320 && parsed.rightbar === 420 && parsed.session === "session-late";
+	})(), `stored = ${String(storage.get("dsh.view-state.v1"))}`);
+	clock.restore();
+}
+
+// 8d. KNOWN-absent still removes (the mirror image of 8c)
+{
+	resetPage({ search: "?dsh_session=session-nope&dsh_rightbar=420&token=xyz" });
+	const slots = makeSlots();
+	const store = makeSlotStore({ sidebar: 280, viewportWidth: 1400, rightbar: null });
+	slots.set("root", [{ options: {}, component: () => null, store: makeSlotStoreHandle(store.instance) }]);
+	// The list IS loaded and provably lacks `session-nope`, and it has no current
+	// selection: the session fact is known to be absent, so its parameter goes.
+	const sessions = makeSessions({
+		ids: ["session-other"],
+		byId: { "session-other": { id: "session-other" } },
+		current: void 0,
+	});
+	boot(fakeCtx({ sessions: sessions.service, slotsService: slots.service }));
+	check("known-absent: the proven-unknown session parameter was removed", !page.search.includes("dsh_session"), `search = ${page.search}`);
+	check(
+		"known-absent: the rest of the URL is intact",
+		page.search === "?dsh_rightbar=420&token=xyz&dsh_sidebar=280",
+		`search = ${page.search}`,
+	);
+	check("known-absent: token preserved", page.search.includes("token=xyz"));
+	check("known-absent: exactly one warning, naming the dropped parameter", page.warnings.length === 1 && page.warnings[0].includes("dsh_session"), `warnings = ${JSON.stringify(page.warnings)}`);
+}
+
+// 8e. a mixed boot: the widths are known (the seat is reachable) while the
+//     session list has not resolved — only the session parameter stays untouched
+{
+	resetPage({ search: "?dsh_session=session-late&dsh_sidebar=320&token=xyz" });
+	const slots = makeSlots();
+	const store = makeSlotStore({ sidebar: 280, viewportWidth: 1400, rightbar: null });
+	slots.set("root", [{ options: {}, component: () => null, store: makeSlotStoreHandle(store.instance) }]);
+	const sessions = makeSessions({ ids: [], byId: {}, current: void 0 });
+	boot(fakeCtx({ sessions: sessions.service, slotsService: slots.service }));
+	await microtasks();
+	check("mixed: the known width was applied", store.instance.getSnapshot().layoutInfo.sidebar === 320, `sidebar = ${store.instance.getSnapshot().layoutInfo.sidebar}`);
+	check("mixed: the unresolved session parameter survived", page.search.includes("dsh_session=session-late"), `search = ${page.search}`);
+	check(
+		"mixed: exactly the known facts moved, the unknown one did not",
+		page.search === "?dsh_session=session-late&dsh_sidebar=320&token=xyz&dsh_rightbar=0",
+		`search = ${page.search}`,
+	);
+}
+
+// 8f. a root seat that never appears must not degrade a boot whose session list
+//     also never resolves — the warning is still one, and still late
+{
+	resetPage({ search: "?dsh_session=session-late&dsh_sidebar=320" });
+	const clock = installFakeClock();
+	const slots = makeSlots();
+	const sessions = makeSessions({ ids: [], byId: {}, current: void 0 });
+	boot(fakeCtx({ sessions: sessions.service, slotsService: slots.service }));
+	await microtasks();
+	check("late boot: no warning while both watches are still waiting", page.warnings.length === 0, `warnings = ${JSON.stringify(page.warnings)}`);
+	clock.flush();
+	check("late boot: the layout degrade is reported once the layout retries are spent", page.warnings.length === 1 && page.warnings[0].includes("panel widths cannot be restored"), `warnings = ${JSON.stringify(page.warnings)}`);
+	check("late boot: both parameters survive the give-up", page.search === "?dsh_session=session-late&dsh_sidebar=320", `search = ${page.search}`);
+	clock.restore();
 }
 
 // ---------------------------------------------------------------------------

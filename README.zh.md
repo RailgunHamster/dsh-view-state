@@ -1,6 +1,6 @@
 # dsh-view-state
 
-[![test](https://img.shields.io/badge/test-101%20assertions%20passing-brightgreen)](#测试) · [English](README.md)
+[![test](https://img.shields.io/badge/test-137%20assertions%20passing-brightgreen)](#测试) · [English](README.md)
 
 **让 DeepSeek Harness（`dsh`）Web UI 的「每标签页视图状态」可被外部寻址。**
 
@@ -33,12 +33,34 @@ CSS**。
    `/s/<sessionId>` 深链继续可用。
 2. **外来参数按字节、按顺序原样保留。** 尤其是 `token`：绝不解码、不重新编码、
    不重排 —— 服务端就是用它完成鉴权的。
-3. 无法解析的、以及负数的宽度一律视为**缺失**，而不是 `0`。
-4. URL 与 `localStorage` 同时有值时 **URL 优先**；`localStorage` 只补 URL 的
+3. **「未知」不等于「缺失」。** 尚未读取到的事实（布局 store 还没挂载、会话列表
+   还没加载）会让对应参数**保持调用方给出的原样**。只有当事实被**确知为缺失**
+   （例如会话列表已加载且确实不含该 id）时才删除参数。因为首次读取太早而抹掉
+   包装器传入的 `?dsh_sidebar=320` 属于数据丢失，而不是降级路径。
+4. **可达性是重试出来的，绝不只采样一次。** `ui-layout` 在本插件激活**之后**才把
+   被「钉住」的布局 store 注册到 `root` 插槽上，因此插件先等待注册表自身的变更
+   通知（`ctx.slots.subscribe("root", …)`），并以递增间隔轮询兜底，等座席出现后
+   再应用请求的宽度。「无法恢复宽度」警告**只发一次，且只在整条重试计划用尽之后**。
+5. 无法解析的、以及负数的宽度一律视为**缺失**，而不是 `0`。
+6. URL 与 `localStorage` 同时有值时 **URL 优先**；`localStorage` 只补 URL 的
    空缺。若 URL 已与实时状态一致，则**完全不重写**。
-5. 未知会话 id **软失败**：只丢弃该参数，其余功能照常。
-6. 任何服务缺失、插槽缺失或异常都被吞掉，每次激活**最多一条**
+7. 未知会话 id **软失败**：只丢弃该参数，其余功能照常。
+8. 任何服务缺失、插槽缺失或异常都被吞掉，每次激活**最多一条**
    `console.warn`。
+
+### 0.2.0 改了什么
+
+两个彼此独立的缺陷，都在真实浏览器中复现过：
+
+- **基于重试的可达性。** 旧实现在 `apply()` 里同步地只探测一次
+  `ctx.slots.entries("root")`。在真实的 `0.1.5-rc.1` web profile 上实测：这次探测
+  永远是空的 —— `ui-layout` 大约 4 秒后才注册该座席 —— 于是唯一一次尝试失败、
+  插件发出警告，宽度从未被应用。现在插件会等待座席（注册表通知 + 递增轮询），
+  座席出现后再应用请求的状态。
+- **「未知」≠ `null`。** 未读取到的事实过去会以 `null` 发布，而 URL 写入器把
+  `null` 解释为「删除该参数」。于是包装器传入的 `?dsh_sidebar=320` 在启动窗口内
+  被页面删除，`location.search` 最终为空。现在每个事实都显式携带「是否已知」，
+  只有确知缺失时才删除参数。
 
 ---
 
@@ -153,11 +175,15 @@ webView.Source = new Uri(restored);
   往返有效；会话 id 是不透明且本地的。
 - **访问布局 store 依赖一项实现细节。** 插件从 `root` 插槽注册项的 `store`
   座席取得实时 store，并校验它已被「钉住」（两次 `create()` 必须返回同一对象）。
-  若未来的 ui-layout 不再钉住它，宽度恢复会退化为一条警告，而 URL /
-  localStorage 双向镜像仍继续工作。见
+  该座席是在本插件激活**之后**才注册的（实测：`apply()` 内
+  `entries("root")` 为空，约 4 秒后才出现一个条目），因此插件会等待它。若未来的
+  ui-layout 始终不注册被钉住的 store，宽度恢复会退化为一条警告 —— **在重试计划
+  用尽之后**（约 7.5 秒）—— 而 URL / localStorage 双向镜像仍继续工作。见
   [`docs/API-NOTES.md` §2.3](docs/API-NOTES.md)。
-- **未在真实浏览器中验证。** 本仓库带有 stub-Cordis 测试；此处并未实际跑过
-  WebView。见 [`docs/API-NOTES.md` §7](docs/API-NOTES.md)。
+- **已在真实浏览器中验证**（headless Edge + CDP，真实 web profile 且已安装插件）：
+  `?dsh_sidebar=320` 恢复出约 320 px 的侧边栏且该参数在整个启动过程中存活；
+  `?dsh_sidebar=0` 折叠为约 56 px 的窄轨；不带任何参数加载则镜像 store 自身的
+  默认值。见 [`docs/API-NOTES.md` §7](docs/API-NOTES.md)。
 
 ---
 
@@ -167,11 +193,15 @@ webView.Source = new Uri(restored);
 node test/client-half.test.mjs     # 或：npm test
 ```
 
-101 条断言，零依赖，无需浏览器：用一份手写的假 `ctx`（服务 `sessions`、
+137 条断言，零依赖，无需浏览器：用一份手写的假 `ctx`（服务 `sessions`、
 `layout`、`slots`，以及 `effect`）加载真实的 `lib/client.js`，并配合
-`window`、`history`、`localStorage` 的替身。覆盖内容：冻结契约、精确的 URL
-字符串结果、pathname 保留、`token` 保留与外来参数的字节级不变、未知 id 丢弃、
-localStorage 回退与优先级、未钉住 store 的探测，以及 effect 卸载。
+`window`、`history`、`localStorage` 以及一对可控的 `setTimeout`/`clearTimeout`
+替身。覆盖内容：冻结契约、精确的 URL 字符串结果、pathname 保留、`token` 保留与
+外来参数的字节级不变、未知 id 丢弃、localStorage 回退与优先级、未钉住 store 的
+探测，以及 effect 卸载 —— 外加 0.2.0 的两处修复：`root` 插槽只在第 N 个 tick
+出现（宽度被读取、应用、镜像，且在重试耗尽前不发警告），以及「未知 vs null」
+规则（未知事实绝不删除参数，确知缺失仍然删除）。每个用例都会先卸载自己的 fiber，
+因此退役的重试定时器绝不会泄漏到下一条断言。
 
 ---
 

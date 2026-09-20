@@ -1,6 +1,6 @@
 {
   "name": "dsh-view-state",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Addressable per-tab view state for the DeepSeek Harness (dsh) web UI: mirrors the selected session and both panel widths into dsh_session/dsh_sidebar/dsh_rightbar query parameters, and restores them on load, so an external shell can read and replay what the user was looking at.",
   "type": "module",
   "main": "lib/index.js",

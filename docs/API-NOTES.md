@@ -139,6 +139,10 @@ instance.actions.setSidebar(px);         // write: arbitrary px
 instance.actions.setRightbar(px);
 ```
 
+…but only **after the seat exists**: at `apply()` time this array is empty in
+practice (§2.3.1), so callers must wait for the registry change notification or
+poll. The snippet above is the shape of the read, not a boot-time recipe.
+
 This works **only because ui-layout pinned `create()`**. The plugin verifies that
 property rather than assuming it: it calls `create()` twice and requires the two
 results to be identical objects. A plain `defineStore` handle returns a fresh
@@ -147,7 +151,58 @@ deliberately does not dedupe or throw"), so an unpinned handle fails the probe a
 the plugin declines to mutate a store nobody is rendering — which is why the test
 suite has an explicit "un-pinned store" case.
 
-There is a second, weaker route to the actions: `ctx.layout` itself is built from
+### 2.3.1 Timing: the seat is registered *after* a third-party `apply()`
+
+**This is the correction that 0.2.0 exists for.** Reading the registry is not
+enough; it has to be read *late enough*. Measured on a live `0.1.5-rc.1` web
+profile (plugin installed, headless Edge over CDP, diagnostic build logging
+`ctx.slots.entries("root")` from inside the plugin):
+
+```
+DVV entries=0 []                                                   <- inside apply(): entries("root") is EMPTY
+DVV later entries=1 [{"hasStore":true,"createType":"function"}]     <- ~4 s later: exactly one entry, with a store
+```
+
+So the earlier version of this plugin, which called `resolveLayoutStore()` exactly
+once — synchronously, inside `apply()` — always degraded:
+
+```
+dsh-view-state: panel widths cannot be restored (no pinned layout store was found on the 'root' slot); URL and localStorage mirroring continue
+```
+
+`ui-layout`'s `register()` call happens after our `apply()` has already run. The
+slot registry offers the notification needed to wait for it:
+
+> `subscribe(key: keyof SlotMap & string, fn: () => void): () => void;` — "Subscribe to a key's registration changes (microtask-batched)."
+> — `dsh-client-ui-renderer/lib/types/client/registry.d.ts`
+
+and ui-layout itself already uses it: `const disposePanels = ctx.slots.subscribe("main", retainMainPanels);`
+(`dsh-client-ui-layout/lib/client.js`). 0.2.0 therefore waits on
+`ctx.slots.subscribe("root", …)` and keeps an escalating polling fallback
+(`LAYOUT_RETRY_DELAYS = [0, 50, 150, 400, 900, 2000, 4000]`, the same shape as the
+session schedule) for a registry without `subscribe()` or an un-pinned store that
+becomes pinned later. The degrade warning is emitted once, and only after that
+schedule is exhausted (~7.5 s cumulative), never on the first empty read.
+
+### 2.3.2 Unknown ≠ null (the second, independent defect)
+
+The first read being empty must not be *published* either. The old mirror treated
+"no reading was taken" as `null`, and `null` in the URL writer means "remove the
+parameter" — so a wrapper-supplied `?dsh_sidebar=320` was deleted by the page
+during the boot window and `location.search` came back empty:
+
+```
+location.search = ""                                              <- the plugin removed the parameter it was given
+localStorage["dsh.view-state.v1"] = {"session":null,"sidebar":null,"rightbar":null}
+sidebar rendered at 280 (the default)                             <- nothing was applied
+```
+
+Every published fact is now `{ known: false }` or `{ known: true, value }`. A
+parameter is written when its fact is known and present, removed only when the
+fact is known to be absent, and copied through untouched while it is unknown. The
+same rule covers `dsh_session` while the session list has not resolved.
+
+### 2.3.3 The second, weaker route to the actions: `ctx.layout` itself is built from
 `instance.actions`, so its own methods write to the same store. But it only
 exposes `toggleSidebar` (0 ⟷ contract default) and `openRightbar`/`closeRightbar`,
 so it cannot set an arbitrary px and cannot be read at all. The plugin uses it for
@@ -339,6 +394,7 @@ second copy is never installed.
 | `dsh_rightbar` = `<px>` | yes, `layoutInfo.rightbar` | yes, via `setRightbar(px)` | exact within `[300, 0.7 × viewport]`, re-clamped by the store |
 | `dsh_rightbar` = `0` | yes, `layoutInfo.rightbar === null` ("no saved width yet") | not applied; nothing to apply | exact as *absence* |
 | right panel shown/hidden | **no** | **no** | owned by ui-sidebar-right's per-session store; see §2.5 |
+| a fact that is still **unknown** | **no** | **no** | its parameter is left exactly as supplied; only a *known-absent* fact removes one (§2.3.2) |
 | `token` and every foreign param | preserved byte-for-byte | never read, never rewritten | exact |
 | pathname (`/s/<id>` etc.) | never touched | never touched | exact |
 
@@ -351,18 +407,45 @@ second copy is never installed.
 - Every API claim above was read from the shipped `.js`/`.d.ts` on this machine.
 - `lib/client.js` syntax-checks under Node 24 (`node --check`).
 - `lib/index.js` is loadable ESM exporting a function `apply`.
-- 101 stub-Cordis assertions pass (`node test/client-half.test.mjs`), covering the
+- 137 stub-Cordis assertions pass (`node test/client-half.test.mjs`), covering the
   frozen contract, both fail-soft paths, the localStorage precedence rules, the
-  parameter-hygiene rules, the un-pinned-store probe, and effect teardown.
+  parameter-hygiene rules, the un-pinned-store probe, effect teardown, and both
+  0.2.0 fixes: an Nth-tick `root` seat (retried, applied, mirrored, no warning
+  before the schedule is spent) and the unknown-vs-absent rule.
+- **Real browser, end to end.** Headless Edge over CDP, against a live
+  `dsh --profile web --port 3081 --no-open` profile with this plugin installed;
+  the client module is served from disk, so `lib/client.js` was synced into the
+  profile and re-measured without a dsh restart. The served bundle was confirmed
+  to contain the new code (`hasRetryCode: true`). Three boots, each with a fresh
+  browser profile, token-authenticated first and then navigated to the URL under
+  test:
 
-**Not verified here (no browser available in this environment)**
+  | Boot URL | `location.search` after boot | `localStorage["dsh.view-state.v1"]` | rendered sidebar (`div[class*="sidebarCol"]`) | plugin console output |
+  |---|---|---|---|---|
+  | `?dsh_sidebar=320` | `?dsh_sidebar=320&dsh_rightbar=0` | `{"session":null,"sidebar":320,"rightbar":0}` | **320 px** | none |
+  | `?dsh_sidebar=0` | `?dsh_sidebar=0&dsh_rightbar=0` | `{"session":null,"sidebar":0,"rightbar":0}` | **56 px** (`.…_collapsed` rail) | none |
+  | *(no parameters)* | `?dsh_sidebar=280&dsh_rightbar=0` | `{"session":null,"sidebar":280,"rightbar":0}` | **280 px** (store default) | none |
 
-- Real behaviour inside the running web UI: that `ctx.slots.entries("root")[0]`
-  is the layout entry at the moment this plugin activates, and that the store's
-  `create()` is in fact pinned at that version.
-- Real React render behaviour after a restored width, and the right panel's
-  `syncPresentation` interplay.
+  All three are the success criteria, measured rather than reasoned: the supplied
+  parameter survives and is mirrored back from the store, the width is actually
+  applied to the rendered frame, and **no degraded warning is emitted** in any
+  case. The pre-0.2.0 behaviour of the same first row was
+  `location.search = ""` plus the "panel widths cannot be restored" warning.
+
+**Not verified here**
+
+- That `ctx.slots.entries("root")[0]` is the layout entry at the moment this
+  plugin activates: measured false (§2.3.1). What *is* verified is that the seat
+  arrives later and the retry reaches it — hence the design.
+- Real React render behaviour *between* the store write and the next paint, and
+  the right panel's `syncPresentation` interplay (the right panel's saved width
+  round-trips in the store; whether it is *shown* is not ours, §2.5).
 - That `history.replaceState` on this origin preserves the app's routing state
   (the app has no router, so there is nothing to preserve, but this is inferred
   from the absence of `pushState`/`hash` usage rather than observed).
-- Cordis's real `ctx.effect` disposal timing (the stub models it).
+- Cordis's real `ctx.effect` disposal timing (the stub models it), and the real
+  registry's microtask batching of `slots.subscribe` (the CDP runs prove the
+  event path reaches the seat; the unit test models the notification as
+  synchronous so the Nth-tick case is deterministic).
+- The un-pinned-store and retry-exhaustion paths were exercised only in the
+  browser against the *working* pinning; the failure branches are unit-tested.
