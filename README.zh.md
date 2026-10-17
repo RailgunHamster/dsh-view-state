@@ -130,9 +130,12 @@ dsh web           # 重启 Web GUI，然后刷新页面
 > ```
 
 **环境要求：** 带 web profile 的 dsh，大约 `0.1.0-rc.6` 及以上（本插件针对
-`0.1.5-rc.1`/`0.1.5-rc.2` 开发）。无需其他依赖 —— `sessions`、`layout`、`slots`
-都由官方 web bundle 组合，且本插件**不声明任何硬性服务依赖**，因此永远不会把
-启动流程卡住。
+`0.1.5-rc.1`/`0.1.5-rc.2` 开发；`0.2.0-rc.2` 与 `0.2.1-rc.2` 已实测兼容 —— 本插件
+读取的 0.2.x 客户端接口面 —— `slots.entries/subscribe`、根布局 store
+（`panelInfo.activePanelId`、`layoutInfo.rightbar`、`actions.setRightbar`）以及
+`sessions.list.getSnapshot().current` —— 均未变化）。无需其他依赖 —— `sessions`、
+`layout`、`slots` 都由官方 web bundle 组合，且本插件**不声明任何硬性服务依赖**，
+因此永远不会把启动流程卡住。
 
 ---
 

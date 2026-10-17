@@ -151,7 +151,11 @@ dsh web           # restart the Web GUI, then refresh the page
 > ```
 
 **Requirements:** dsh with a web profile, roughly `0.1.0-rc.6` or newer
-(`0.1.5-rc.1`/`0.1.5-rc.2` is what this was developed against). Nothing else is
+(`0.1.5-rc.1`/`0.1.5-rc.2` is what this was developed against; `0.2.0-rc.2`
+and `0.2.1-rc.2` are measured compatible — the 0.2.x client surface this
+plugin reads — `slots.entries/subscribe`, the root layout store
+(`panelInfo.activePanelId`, `layoutInfo.rightbar`, `actions.setRightbar`) and
+`sessions.list.getSnapshot().current` — is unchanged). Nothing else is
 needed — `sessions`, `layout` and `slots` are all composed by the shipped web
 bundle, and the plugin declares **no hard service dependency**, so it can never
 wedge a boot.
