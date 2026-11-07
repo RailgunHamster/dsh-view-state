@@ -1,6 +1,6 @@
 # dsh-view-state
 
-[![test](https://img.shields.io/badge/test-175%20assertions%20passing-brightgreen)](#测试) · [English](README.md)
+[![test](https://img.shields.io/badge/test-188%20assertions%20passing-brightgreen)](#测试) · [English](README.md)
 
 **让 DeepSeek Harness（`dsh`）Web UI 的「每标签页视图状态」可被外部寻址。**
 
@@ -103,6 +103,19 @@ profile 上验证过：
 此前所有保证不变：只用 `replaceState`、pathname 不动、外来参数按字节保留、软失败、
 无 UI/DOM/CSS。这些回退都只是被守卫的**运行时**触达，而不是承诺：若未来版本移除了
 该属性或该服务，行为与 0.2.0 完全一致。
+
+### 0.2.3 改了什么
+
+DSH `0.2.2-rc.1` 将视图选择与会话导航从 `@deepseek-ai/dsh-api-session-controller`
+（`ctx.sessions`）拆分到了 `@deepseek-ai/dsh-client-ui-workspace`
+（`ctx.uiWorkspace`）：`sessions.list` 不再包含 `.current`，`sessions.selection`
+迁至 `uiWorkspace.selection`（依然持久化在 `localStorage["dsh.sessions.current"]`），
+`sessions.open(id)` 改为 `uiWorkspace.openSession(id)`。`0.2.3` 同时兼容新旧两套
+结构：优先读取 `list.current`（`0.1.x`–`0.2.1`），随后依次读取
+`uiWorkspace.selection` / `sessions.selection` 与 `uiWorkspace.mainReference` /
+`retainedBy.mainView`（`0.2.2+`），通过 `sessions.open` 或
+`uiWorkspace.openSession` 打开深链会话，并在 `sessions` 早于 `uiWorkspace` 发布时
+按重试计划等待。
 
 ---
 
@@ -249,7 +262,7 @@ webView.Source = new Uri(restored);
 node test/client-half.test.mjs     # 或：npm test
 ```
 
-175 条断言，零依赖，无需浏览器：用一份手写的假 `ctx`（服务 `sessions`、
+188 条断言，零依赖，无需浏览器：用一份手写的假 `ctx`（服务 `sessions`、
 `layout`、`slots`，以及 `effect`）加载真实的 `lib/client.js`，并配合
 `window`、`history`、`localStorage` 以及一对可控的 `setTimeout`/`clearTimeout`
 替身。覆盖内容：冻结契约、精确的 URL 字符串结果、pathname 保留、`token` 保留与

@@ -373,7 +373,7 @@ function installFakeClock() {
  * Services are optional on purpose — the plugin must survive without any of
  * them, so the test constructs ctxs with arbitrary subsets.
  */
-function fakeCtx({ sessions, layoutStore, layout = true, slots = true, slotsService, get = true } = {}) {
+function fakeCtx({ sessions, uiWorkspace, layoutStore, layout = true, slots = true, slotsService, get = true } = {}) {
 	const effects = [];
 	const ctx = {
 		services: new Map(),
@@ -396,6 +396,7 @@ function fakeCtx({ sessions, layoutStore, layout = true, slots = true, slotsServ
 		ctx.get = (name) => ctx.services.get(name);
 	}
 	if (sessions !== void 0) ctx.services.set("sessions", sessions);
+	if (uiWorkspace !== void 0) ctx.services.set("uiWorkspace", uiWorkspace);
 	if (layout) ctx.services.set("layout", { selectPanel() {}, toggleSidebar() {}, openRightbar() {}, closeRightbar() {}, beginNavigation: () => new AbortController().signal });
 	if (slotsService !== void 0) {
 		ctx.services.set("slots", slotsService);
@@ -1539,6 +1540,161 @@ check(
 	const disposers = booted[booted.length - 1].effects;
 	for (const disposer of disposers) if (typeof disposer === "function") disposer();
 	check("late service: unload released the binding", page.warnings.length <= 1, `warnings = ${JSON.stringify(page.warnings)}`);
+}
+
+// ---------------------------------------------------------------------------
+// 10. DSH 0.2.2+ split: `sessions` owns the catalog (`list`), while
+//     `uiWorkspace` owns view selection (`selection`, `mainReference`) and
+//     navigation (`openSession`)
+// ---------------------------------------------------------------------------
+
+/**
+ * Build a 0.2.2-style `sessions` + `uiWorkspace` pair.
+ * `sessions` has no `.open`, no `.selection`, and no `list.current`.
+ */
+function make022Services(initialList, initialSelection = {}) {
+	let snapshot = initialList;
+	const listListeners = new Set();
+	const selection = makeSelectionStore(initialSelection);
+	const sessions = {
+		list: {
+			getSnapshot: () => snapshot,
+			subscribe(fn) {
+				listListeners.add(fn);
+				return () => listListeners.delete(fn);
+			},
+		},
+		set(next) {
+			snapshot = next;
+			for (const fn of [...listListeners]) fn();
+		},
+	};
+	const uiWorkspace = {
+		selection: selection.store,
+		mainReference: initialSelection.sessionId ? { sessionId: initialSelection.sessionId } : void 0,
+		openSession(id) {
+			if (!Object.prototype.hasOwnProperty.call(snapshot.byId ?? {}, id)) {
+				throw new Error(`unknown session ${id}`);
+			}
+			opened.push(id);
+			// Mirror real UiWorkspaceService.replaceMain order:
+			// 1. retain mainView on list
+			// 2. selection.set({ sessionId: id })
+			// 3. mainReference = { sessionId: id }
+			const nextById = {};
+			for (const [k, v] of Object.entries(snapshot.byId)) {
+				nextById[k] = { ...v, retainedBy: k === id ? { mainView: 1 } : {} };
+			}
+			snapshot = { ...snapshot, byId: nextById };
+			for (const fn of [...listListeners]) fn();
+			selection.set({ sessionId: id });
+			this.mainReference = { sessionId: id };
+		},
+		clearMain() {
+			this.mainReference = void 0;
+			selection.set({});
+			const nextById = {};
+			for (const [k, v] of Object.entries(snapshot.byId ?? {})) {
+				nextById[k] = { ...v, retainedBy: {} };
+			}
+			snapshot = { ...snapshot, byId: nextById };
+			for (const fn of [...listListeners]) fn();
+		},
+	};
+	return { sessions, uiWorkspace, selection };
+}
+
+// 10a. 0.2.2+ deep link opens via `uiWorkspace.openSession` and mirrors selection
+{
+	resetPage({ search: "?dsh_session=session-022&dsh_sidebar=300&token=xyz" });
+	opened = [];
+	const store = makeSlotStore({ sidebar: 280, viewportWidth: 1400, rightbar: null });
+	const { sessions, uiWorkspace } = make022Services(
+		{
+			ids: ["session-old", "session-022"],
+			byId: {
+				"session-old": { id: "session-old", retainedBy: { mainView: 1 } },
+				"session-022": { id: "session-022", retainedBy: {} },
+			},
+			phase: "ready",
+		},
+		{ sessionId: "session-old" },
+	);
+	boot(fakeCtx({ sessions, uiWorkspace, layoutStore: makeSlotStoreHandle(store.instance) }));
+	check("0.2.2 deep link: opened via uiWorkspace.openSession", opened.length === 1 && opened[0] === "session-022", `opened = ${JSON.stringify(opened)}`);
+	check("0.2.2 deep link: URL carries the deep-linked session", page.search === "?dsh_session=session-022&dsh_sidebar=300&token=xyz&dsh_rightbar=0", `search = ${page.search}`);
+	check("0.2.2 deep link: localStorage carries the deep-linked session", JSON.parse(storage.get("dsh.view-state.v1")).session === "session-022", `stored = ${storage.get("dsh.view-state.v1")}`);
+}
+
+// 10b. 0.2.2+ live session switch and clearMain via `uiWorkspace.selection`
+{
+	resetPage({ search: "?token=xyz" });
+	opened = [];
+	const store = makeSlotStore({ sidebar: 280, viewportWidth: 1400, rightbar: null });
+	const { sessions, uiWorkspace, selection } = make022Services(
+		{
+			ids: ["session-1", "session-2"],
+			byId: {
+				"session-1": { id: "session-1", retainedBy: { mainView: 1 } },
+				"session-2": { id: "session-2", retainedBy: {} },
+			},
+			phase: "ready",
+		},
+		{ sessionId: "session-1" },
+	);
+	boot(fakeCtx({ sessions, uiWorkspace, layoutStore: makeSlotStoreHandle(store.instance) }));
+	check("0.2.2 mirror: initial uiWorkspace.selection mirrored into URL", page.search === "?token=xyz&dsh_session=session-1&dsh_sidebar=280&dsh_rightbar=0", `search = ${page.search}`);
+
+	uiWorkspace.openSession("session-2");
+	check("0.2.2 mirror: switching session via uiWorkspace updates URL", page.search === "?token=xyz&dsh_session=session-2&dsh_sidebar=280&dsh_rightbar=0", `search = ${page.search}`);
+
+	uiWorkspace.clearMain();
+	check("0.2.2 mirror: clearing main session removes dsh_session from URL", page.search === "?token=xyz&dsh_sidebar=280&dsh_rightbar=0", `search = ${page.search}`);
+
+	const disposers = booted[booted.length - 1].effects;
+	for (const disposer of disposers) if (typeof disposer === "function") disposer();
+	check("0.2.2 mirror: unload released uiWorkspace.selection subscription", selection.listenerCount() === 0, `listeners = ${selection.listenerCount()}`);
+}
+
+// 10c. 0.2.2+ `uiWorkspace` arrives a tick AFTER `sessions`: deep link waits for opener
+{
+	resetPage({ search: "?dsh_session=session-target&token=xyz" });
+	opened = [];
+	const clock = installFakeClock();
+	const store = makeSlotStore({ sidebar: 280, viewportWidth: 1400, rightbar: null });
+	const { sessions, uiWorkspace } = make022Services(
+		{
+			ids: ["session-target"],
+			byId: { "session-target": { id: "session-target", retainedBy: {} } },
+			phase: "ready",
+		},
+		{ sessionId: "session-other" },
+	);
+	const ctx = fakeCtx({ sessions, layoutStore: makeSlotStoreHandle(store.instance) });
+	boot(ctx);
+	await microtasks();
+	check("0.2.2 late uiWorkspace: deep link not erased before uiWorkspace arrives", page.search.includes("dsh_session=session-target"), `search = ${page.search}`);
+	check("0.2.2 late uiWorkspace: not opened yet while uiWorkspace is absent", opened.length === 0, `opened = ${JSON.stringify(opened)}`);
+
+	ctx.services.set("uiWorkspace", uiWorkspace);
+	clock.tick(1);
+	check("0.2.2 late uiWorkspace: opened once uiWorkspace arrived", opened.length === 1 && opened[0] === "session-target", `opened = ${JSON.stringify(opened)}`);
+	check("0.2.2 late uiWorkspace: URL keeps session-target", page.search.includes("dsh_session=session-target"), `search = ${page.search}`);
+	clock.restore();
+}
+
+// 10d. 0.2.2+ empty catalog with `phase: "ready"` drops unknown deep-linked session
+{
+	resetPage({ search: "?dsh_session=session-gone&token=xyz" });
+	opened = [];
+	const store = makeSlotStore({ sidebar: 280, viewportWidth: 1400, rightbar: null });
+	const { sessions, uiWorkspace } = make022Services(
+		{ ids: [], byId: {}, phase: "ready" },
+		{},
+	);
+	boot(fakeCtx({ sessions, uiWorkspace, layoutStore: makeSlotStoreHandle(store.instance) }));
+	check("0.2.2 empty ready list: unknown session dropped", !page.search.includes("dsh_session"), `search = ${page.search}`);
+	check("0.2.2 empty ready list: warning emitted once", page.warnings.length === 1 && page.warnings[0].includes("unknown session id session-gone"), `warnings = ${JSON.stringify(page.warnings)}`);
 }
 
 // ---------------------------------------------------------------------------

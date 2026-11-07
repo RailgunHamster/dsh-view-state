@@ -1,6 +1,6 @@
 # dsh-view-state
 
-[![test](https://img.shields.io/badge/test-175%20assertions%20passing-brightgreen)](#testing) · [中文](README.zh.md)
+[![test](https://img.shields.io/badge/test-188%20assertions%20passing-brightgreen)](#testing) · [中文](README.zh.md)
 
 **Addressable per-tab view state for the DeepSeek Harness (`dsh`) web UI.**
 
@@ -122,6 +122,20 @@ guarantee is unchanged: `replaceState` only, the pathname untouched, foreign
 parameters byte-exact, fail-soft, no UI/DOM/CSS. The fallbacks are guarded
 *runtime* reaches, never promises: if a future version drops the property or the
 service, behaviour is exactly what it was in 0.2.0.
+
+### What changed in 0.2.3
+
+In DSH `0.2.2-rc.1`, view selection and session navigation moved out of
+`@deepseek-ai/dsh-api-session-controller` (`ctx.sessions`) into
+`@deepseek-ai/dsh-client-ui-workspace` (`ctx.uiWorkspace`): `sessions.list` no
+longer carries `.current`, `sessions.selection` moved to
+`uiWorkspace.selection` (still persisted to `localStorage["dsh.sessions.current"]`),
+and `sessions.open(id)` was replaced by `uiWorkspace.openSession(id)`. `0.2.3`
+supports both layouts: it reads `list.current` when present (`0.1.x`–`0.2.1`),
+falls back across `uiWorkspace.selection` / `sessions.selection` and
+`uiWorkspace.mainReference` / `retainedBy.mainView` (`0.2.2+`), opens deep-linked
+sessions through `sessions.open` or `uiWorkspace.openSession`, and waits on the
+retry schedule if `sessions` is published a tick before `uiWorkspace`.
 
 ---
 
@@ -285,7 +299,7 @@ underlying API facts are in [`docs/API-NOTES.md`](docs/API-NOTES.md).
 node test/client-half.test.mjs     # or: npm test
 ```
 
-175 assertions, no dependencies, no browser: the real `lib/client.js` is loaded
+188 assertions, no dependencies, no browser: the real `lib/client.js` is loaded
 through a hand-written fake `ctx` (services `sessions`, `layout`, `slots`, plus
 `effect`), with `window`, `history`, `localStorage` and a controllable
 `setTimeout`/`clearTimeout` pair. It covers the frozen contract, the exact
