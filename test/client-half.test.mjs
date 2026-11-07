@@ -397,6 +397,20 @@ function fakeCtx({ sessions, uiWorkspace, layoutStore, layout = true, slots = tr
 	}
 	if (sessions !== void 0) ctx.services.set("sessions", sessions);
 	if (uiWorkspace !== void 0) ctx.services.set("uiWorkspace", uiWorkspace);
+	const rawGet = ctx.get;
+	if (rawGet) {
+		ctx.get = (name) => {
+			const svc = rawGet(name);
+			// Cordis's D2 wraps every Service lookup (`ctx.get("uiWorkspace")`) in a
+			// fresh Proxy on each call. Reproduce that exact contract so a naive
+			// `uiWorkspace === boundUiWorkspace` check would fail in tests just as in
+			// the real browser.
+			if (name === "uiWorkspace" && svc !== null && typeof svc === "object") {
+				return new Proxy(svc, {});
+			}
+			return svc;
+		};
+	}
 	if (layout) ctx.services.set("layout", { selectPanel() {}, toggleSidebar() {}, openRightbar() {}, closeRightbar() {}, beginNavigation: () => new AbortController().signal });
 	if (slotsService !== void 0) {
 		ctx.services.set("slots", slotsService);
@@ -1566,7 +1580,10 @@ function make022Services(initialList, initialSelection = {}) {
 		},
 		set(next) {
 			snapshot = next;
-			for (const fn of [...listListeners]) fn();
+			// Zustand's createStore iterates its live Set with `r.forEach(...)`;
+			// mutating the Set (delete + add) inside a listener causes an infinite
+			// synchronous loop in Set.prototype.forEach.
+			listListeners.forEach((fn) => fn());
 		},
 	};
 	const uiWorkspace = {
